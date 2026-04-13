@@ -1,0 +1,111 @@
+/* Styles for Google Drive Sync plugin */
+.gdrive-sync-ribbon-icon {
+    color: #4285F4;
+}
+
+.gdrive-sync-view {
+	padding: 10px;
+}
+
+.sync-stats-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 10px;
+	margin-bottom: 20px;
+}
+
+.sync-stat {
+	background-color: var(--background-secondary);
+	padding: 10px;
+	border-radius: 8px;
+	text-align: center;
+}
+
+.stat-label {
+	font-size: 0.8em;
+	color: var(--text-muted);
+}
+
+.stat-value {
+	font-size: 1.1em;
+	font-weight: bold;
+}
+
+.current-file-text {
+	font-size: 0.85em;
+	color: var(--text-accent);
+	margin-top: 10px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sync-error-list {
+	margin-top: 10px;
+}
+
+.error-item {
+	background-color: var(--background-secondary-alt);
+	border-left: 3px solid var(--text-error);
+	padding: 8px;
+	margin-bottom: 8px;
+	border-radius: 4px;
+	font-size: 0.85em;
+}
+
+.error-item p {
+	margin: 4px 0 0 0;
+	color: var(--text-muted);
+}
+
+.sync-conflict-list {
+	margin-top: 10px;
+}
+
+.conflict-item {
+	background-color: var(--background-secondary-alt);
+	border-left: 3px solid var(--text-warning);
+	padding: 8px;
+	margin-bottom: 8px;
+	border-radius: 4px;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+}
+
+.conflict-info {
+	flex-grow: 1;
+	font-size: 0.85em;
+	overflow: hidden;
+}
+
+.conflict-info b {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.conflict-info p {
+	margin: 2px 0 0 0;
+	color: var(--text-muted);
+	font-size: 0.9em;
+}
+
+.conflict-open-btn {
+	margin-left: 10px;
+	flex-shrink: 0;
+}
+
+.tether-author-credit {
+	font-size: 0.85em;
+	opacity: 0.6;
+	margin-top: -10px;
+	margin-bottom: 20px;
+}
+
+.conflict-original-path {
+	font-style: italic;
+	font-size: 0.8em;
+	opacity: 0.7;
+}

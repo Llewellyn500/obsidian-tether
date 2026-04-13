@@ -1,0 +1,10 @@
+{
+  "id": "tether-google-drive-sync",
+  "name": "Tether",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "A high-performance Google Drive sync engine by Llewellyn Paintsil.",
+  "author": "Llewellyn Paintsil",
+  "authorUrl": "https://github.com/Llewellyn500",
+  "isDesktopOnly": false
+}
