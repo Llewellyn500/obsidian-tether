@@ -39,6 +39,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	client: GoogleDriveClient;
 	syncEngine: SyncEngine;
 	statusBarItem: HTMLElement;
+	isSyncing: boolean = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -163,6 +164,10 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async manualSync() {
+		if (this.isSyncing) {
+			new Notice('Sync is already in progress.');
+			return;
+		}
 		if (!this.settings.accessToken) {
 			new Notice('Please log in to Google Drive first in settings.');
 			return;
@@ -172,25 +177,32 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			return;
 		}
 		
+		this.isSyncing = true;
 		await this.activateView(); // Show the sidebar when manual sync starts
 		this.setupSyncEngine(); // Re-setup to ensure view reference is fresh
 
-		new Notice('Starting Google Drive Sync...');
+		new Notice('Starting Tether Sync...');
 		try {
 			await this.syncEngine.sync();
 		} catch (error) {
 			console.error('Sync failed', error);
 			new Notice(`Sync failed: ${error.message}`);
+		} finally {
+			this.isSyncing = false;
 		}
 	}
 
 	async backgroundSync() {
-		if (!this.settings.accessToken || !this.settings.folderId) return;
+		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		
+		this.isSyncing = true;
 		this.setupSyncEngine();
 		try {
 			await this.syncEngine.sync();
 		} catch (error) {
 			console.error('Background sync failed', error);
+		} finally {
+			this.isSyncing = false;
 		}
 	}
 

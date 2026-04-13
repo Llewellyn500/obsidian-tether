@@ -287,6 +287,7 @@ var GoogleDriveClient = class {
 var import_obsidian3 = require("obsidian");
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem, view) {
+    this.folderCache = /* @__PURE__ */ new Map();
     this.stats = {
       totalFiles: 0,
       processed: 0,
@@ -323,11 +324,13 @@ var SyncEngine = class {
       this.stats.processed = 0;
       this.stats.failed = 0;
       this.stats.errors = [];
+      this.folderCache.clear();
       this.updateStatus("Loading state...");
       await this.stateManager.load();
       const vaultName = this.app.vault.getName();
       this.updateStatus(`Locating vault root...`);
       const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
+      this.folderCache.set("", vaultRootDriveId);
       this.updateStatus("Fetching remote changes...");
       const remoteMap = await this.buildRemoteMap(vaultRootDriveId);
       this.updateStatus("Scanning local items...");
@@ -442,6 +445,7 @@ var SyncEngine = class {
         remoteMtime: remoteFile.modifiedTime,
         etag: ""
       });
+      await this.stateManager.save();
     } else if (stat.mtime > state.lastSyncedMtime) {
       const content = await this.app.vault.adapter.readBinary(path);
       const remoteFile = await this.client.updateFile(state.driveId, content, mimeType);
@@ -450,20 +454,25 @@ var SyncEngine = class {
         lastSyncedMtime: stat.mtime,
         remoteMtime: remoteFile.modifiedTime
       });
+      await this.stateManager.save();
     }
   }
   async ensureRemotePathByPath(path, vaultRootId) {
     if (!path || path === "." || path === "/")
       return vaultRootId;
+    if (this.folderCache.has(path))
+      return this.folderCache.get(path);
     const state = this.stateManager.get(path);
-    if (state)
+    if (state) {
+      this.folderCache.set(path, state.driveId);
       return state.driveId;
+    }
     const parts = path.split("/");
     const folderName = parts.pop() || "";
     const parentPath = parts.join("/");
     const parentDriveId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
     const existingFolders = await this.client.listFolders(parentDriveId);
-    const existing = existingFolders.find((f) => f.name === folderName);
+    const existing = existingFolders.find((f) => f.name.toLowerCase() === folderName.toLowerCase());
     if (existing) {
       this.stateManager.set(path, {
         driveId: existing.id,
@@ -471,6 +480,8 @@ var SyncEngine = class {
         remoteMtime: existing.modifiedTime,
         etag: ""
       });
+      this.folderCache.set(path, existing.id);
+      await this.stateManager.save();
       return existing.id;
     }
     const remoteFolder = await this.client.createFolder(folderName, parentDriveId);
@@ -480,6 +491,8 @@ var SyncEngine = class {
       remoteMtime: remoteFolder.modifiedTime,
       etag: ""
     });
+    this.folderCache.set(path, remoteFolder.id);
+    await this.stateManager.save();
     return remoteFolder.id;
   }
   async buildRemoteMap(folderId, parentPath = "", depth = 0) {
@@ -512,15 +525,17 @@ var SyncEngine = class {
     if (state)
       return state.driveId;
     const folders = await this.client.listFolders(this.folderId);
-    const existing = folders.find((f) => f.name === name);
+    const existing = folders.find((f) => f.name.toLowerCase() === name.toLowerCase());
     if (existing) {
       const entry2 = { driveId: existing.id, lastSyncedMtime: 0, remoteMtime: existing.modifiedTime, etag: "" };
       this.stateManager.set(stateKey, entry2);
+      await this.stateManager.save();
       return existing.id;
     }
     const newFolder = await this.client.createFolder(name, this.folderId);
     const entry = { driveId: newFolder.id, lastSyncedMtime: 0, remoteMtime: newFolder.modifiedTime, etag: "" };
     this.stateManager.set(stateKey, entry);
+    await this.stateManager.save();
     return newFolder.id;
   }
   async processRemoteFile(path, remoteFile) {
@@ -556,6 +571,7 @@ var SyncEngine = class {
       remoteMtime: remoteFile.modifiedTime,
       etag: ""
     });
+    await this.stateManager.save();
   }
   async ensureLocalPath(path) {
     if (!path || path === ".")
@@ -587,6 +603,7 @@ var SyncEngine = class {
       remoteMtime: remoteFile.modifiedTime,
       etag: ""
     });
+    await this.stateManager.save();
   }
   getMimeType(extension) {
     const mimes = {
@@ -861,6 +878,10 @@ var DEFAULT_SETTINGS = {
   syncOnStartup: true
 };
 var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
+  constructor() {
+    super(...arguments);
+    this.isSyncing = false;
+  }
   async onload() {
     await this.loadSettings();
     this.registerView(VIEW_TYPE_SYNC_STATUS, (leaf) => new SyncStatusView(leaf));
@@ -953,6 +974,10 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
     }
   }
   async manualSync() {
+    if (this.isSyncing) {
+      new import_obsidian7.Notice("Sync is already in progress.");
+      return;
+    }
     if (!this.settings.accessToken) {
       new import_obsidian7.Notice("Please log in to Google Drive first in settings.");
       return;
@@ -961,24 +986,30 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
       new import_obsidian7.Notice("Please select a Google Drive folder in settings.");
       return;
     }
+    this.isSyncing = true;
     await this.activateView();
     this.setupSyncEngine();
-    new import_obsidian7.Notice("Starting Google Drive Sync...");
+    new import_obsidian7.Notice("Starting Tether Sync...");
     try {
       await this.syncEngine.sync();
     } catch (error) {
       console.error("Sync failed", error);
       new import_obsidian7.Notice(`Sync failed: ${error.message}`);
+    } finally {
+      this.isSyncing = false;
     }
   }
   async backgroundSync() {
-    if (!this.settings.accessToken || !this.settings.folderId)
+    if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
       return;
+    this.isSyncing = true;
     this.setupSyncEngine();
     try {
       await this.syncEngine.sync();
     } catch (error) {
       console.error("Background sync failed", error);
+    } finally {
+      this.isSyncing = false;
     }
   }
   async startLogin() {

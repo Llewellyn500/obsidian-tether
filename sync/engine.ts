@@ -10,6 +10,7 @@ export class SyncEngine {
 	folderId: string;
 	statusBarItem: HTMLElement;
 	view?: SyncStatusView;
+	private folderCache: Map<string, string> = new Map();
 	
 	private stats: SyncStats = {
 		totalFiles: 0,
@@ -37,7 +38,6 @@ export class SyncEngine {
 		if (partialStats) {
 			this.stats = { ...this.stats, ...partialStats };
 		}
-		// Safe check for view and method
 		if (this.view && typeof this.view.updateStats === 'function') {
 			this.view.updateStats(this.stats);
 		}
@@ -53,6 +53,7 @@ export class SyncEngine {
 			this.stats.processed = 0;
 			this.stats.failed = 0;
 			this.stats.errors = [];
+			this.folderCache.clear();
 			
 			this.updateStatus('Loading state...');
 			await this.stateManager.load();
@@ -61,6 +62,7 @@ export class SyncEngine {
 			this.updateStatus(`Locating vault root...`);
 			
 			const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
+			this.folderCache.set('', vaultRootDriveId);
 
 			this.updateStatus('Fetching remote changes...');
 			const remoteMap = await this.buildRemoteMap(vaultRootDriveId);
@@ -70,7 +72,7 @@ export class SyncEngine {
 			const localPathSet = new Set(localPaths);
 			this.stats.totalFiles = localPaths.length;
 
-			// 1. Handle Deletions (Mirror local deletion to Drive)
+			// 1. Handle Deletions
 			this.updateStatus('Checking for deletions...');
 			const stateEntries = Object.entries(this.stateManager.state);
 			for (const [path, entry] of stateEntries) {
@@ -81,7 +83,6 @@ export class SyncEngine {
 						this.updateStatus(`Deleting remote: ${path}`);
 						await this.client.deleteFile(entry.driveId);
 						this.stateManager.remove(path);
-						// Crucial: remove from remoteMap so we don't try to pull it in Step 2
 						remoteMap.delete(path);
 					} catch (e) {
 						console.error(`Failed to delete remote ${path}`, e);
@@ -105,7 +106,7 @@ export class SyncEngine {
 					this.stats.failed++;
 					this.stats.errors.push({ path, message: e.message });
 				}
-				this.updateStatus(this.stats.status); // Refresh view
+				this.updateStatus(this.stats.status);
 			}
 
 			// 3. Push Local to Remote
@@ -116,7 +117,6 @@ export class SyncEngine {
 				if (this.stats.processed % 5 === 0 || this.stats.processed === this.stats.totalFiles) {
 					this.updateStatus(`Syncing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ''}`);
 				}
-
 				
 				try {
 					await this.processLocalPath(path, vaultRootDriveId);
@@ -125,7 +125,7 @@ export class SyncEngine {
 					this.stats.failed++;
 					this.stats.errors.push({ path, message: e.message });
 				}
-				this.updateStatus(this.stats.status); // Refresh view
+				this.updateStatus(this.stats.status);
 			}
 
 			this.stats.lastSync = new Date().toLocaleTimeString();
@@ -164,7 +164,7 @@ export class SyncEngine {
 		
 		for (const folder of result.folders) {
 			if (!this.isExcluded(folder)) {
-				items.push(folder); // Include folder itself
+				items.push(folder);
 				const subItems = await this.listAllLocalItems(folder);
 				items.push(...subItems);
 			}
@@ -176,7 +176,6 @@ export class SyncEngine {
 		const stat = await this.app.vault.adapter.stat(path);
 		if (!stat) return;
 
-		// Folders in Obsidian adapter stat often have type 'folder'
 		if (stat.type === 'folder') {
 			await this.ensureRemotePathByPath(path, vaultRootId);
 			return;
@@ -200,6 +199,7 @@ export class SyncEngine {
 				remoteMtime: remoteFile.modifiedTime,
 				etag: ''
 			});
+			await this.stateManager.save();
 		} else if (stat.mtime > state.lastSyncedMtime) {
 			const content = await this.app.vault.adapter.readBinary(path);
 			const remoteFile = await this.client.updateFile(state.driveId, content, mimeType);
@@ -209,14 +209,19 @@ export class SyncEngine {
 				lastSyncedMtime: stat.mtime,
 				remoteMtime: remoteFile.modifiedTime
 			});
+			await this.stateManager.save();
 		}
 	}
 
 	private async ensureRemotePathByPath(path: string, vaultRootId: string): Promise<string> {
 		if (!path || path === '.' || path === '/') return vaultRootId;
+		if (this.folderCache.has(path)) return this.folderCache.get(path)!;
 
 		const state = this.stateManager.get(path);
-		if (state) return state.driveId;
+		if (state) {
+			this.folderCache.set(path, state.driveId);
+			return state.driveId;
+		}
 
 		const parts = path.split('/');
 		const folderName = parts.pop() || '';
@@ -225,7 +230,7 @@ export class SyncEngine {
 		const parentDriveId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
 		
 		const existingFolders = await this.client.listFolders(parentDriveId);
-		const existing = existingFolders.find(f => f.name === folderName);
+		const existing = existingFolders.find(f => f.name.toLowerCase() === folderName.toLowerCase());
 		
 		if (existing) {
 			this.stateManager.set(path, {
@@ -234,6 +239,8 @@ export class SyncEngine {
 				remoteMtime: existing.modifiedTime,
 				etag: ''
 			});
+			this.folderCache.set(path, existing.id);
+			await this.stateManager.save();
 			return existing.id;
 		}
 
@@ -244,6 +251,8 @@ export class SyncEngine {
 			remoteMtime: remoteFolder.modifiedTime,
 			etag: ''
 		});
+		this.folderCache.set(path, remoteFolder.id);
+		await this.stateManager.save();
 
 		return remoteFolder.id;
 	}
@@ -281,17 +290,19 @@ export class SyncEngine {
 		if (state) return state.driveId;
 
 		const folders = await this.client.listFolders(this.folderId);
-		const existing = folders.find(f => f.name === name);
+		const existing = folders.find(f => f.name.toLowerCase() === name.toLowerCase());
 		
 		if (existing) {
 			const entry = { driveId: existing.id, lastSyncedMtime: 0, remoteMtime: existing.modifiedTime, etag: '' };
 			this.stateManager.set(stateKey, entry);
+			await this.stateManager.save();
 			return existing.id;
 		}
 
 		const newFolder = await this.client.createFolder(name, this.folderId);
 		const entry = { driveId: newFolder.id, lastSyncedMtime: 0, remoteMtime: newFolder.modifiedTime, etag: '' };
 		this.stateManager.set(stateKey, entry);
+		await this.stateManager.save();
 		return newFolder.id;
 	}
 
@@ -333,6 +344,7 @@ export class SyncEngine {
 			remoteMtime: remoteFile.modifiedTime,
 			etag: ''
 		});
+		await this.stateManager.save();
 	}
 
 	private async ensureLocalPath(path: string) {
@@ -371,6 +383,7 @@ export class SyncEngine {
 			remoteMtime: remoteFile.modifiedTime,
 			etag: ''
 		});
+		await this.stateManager.save();
 	}
 
 	private getMimeType(extension: string): string {
