@@ -235,7 +235,7 @@ var GoogleDriveClient = class {
       },
       body: JSON.stringify(metadata)
     });
-    const uploadUrl = initResponse.headers["location"];
+    const uploadUrl = initResponse.headers["location"] || initResponse.headers["Location"];
     if (!uploadUrl)
       throw new Error("Failed to get resumable upload URL");
     const uploadResponse = await this.request({
@@ -254,10 +254,12 @@ var GoogleDriveClient = class {
       url: initUrl,
       method: "PATCH",
       headers: {
+        "Content-Type": "application/json; charset=UTF-8",
         "X-Upload-Content-Type": mimeType
-      }
+      },
+      body: JSON.stringify({})
     });
-    const uploadUrl = initResponse.headers["location"];
+    const uploadUrl = initResponse.headers["location"] || initResponse.headers["Location"];
     if (!uploadUrl)
       throw new Error("Failed to get resumable update URL");
     const uploadResponse = await this.request({
@@ -734,47 +736,93 @@ var SetupGuideModal = class extends import_obsidian5.Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("gdrive-setup-modal");
-    contentEl.createEl("h2", { text: "\u{1F680} Google Drive Sync: 2-Minute Setup" });
-    const step1 = contentEl.createEl("div", { cls: "setup-step" });
-    step1.createEl("h3", { text: "1. Create your Google Cloud Project" });
-    const list1 = step1.createEl("ol");
-    list1.createEl("li", { text: "Go to the " }).createEl("a", { text: "Google Cloud Console", href: "https://console.cloud.google.com/" });
-    list1.createEl("li", { text: 'Click the project dropdown (top left) > "New Project".' });
-    list1.createEl("li", { text: `Name it "Obsidian Sync" and click "Create". Wait for the notification that it's ready.` });
-    const step2 = contentEl.createEl("setup-step");
-    step2.createEl("h3", { text: "2. Enable the Drive API (Crucial!)" });
-    const list2 = step2.createEl("ol");
-    list2.createEl("li", { text: 'In the sidebar, go to "APIs & Services" > "Library".' });
-    list2.createEl("li", { text: 'Search for "Google Drive API". Click it and click "Enable".' });
-    list2.createEl("li", { text: "\u26A0\uFE0F If you don't enable this, you will get an error when adding scopes later." });
-    const step3 = contentEl.createEl("div", { cls: "setup-step" });
-    step3.createEl("h3", { text: "3. Configure Consent Screen" });
-    const list3 = step3.createEl("ol");
-    list3.createEl("li", { text: 'Go to "APIs & Services" > "OAuth consent screen".' });
-    list3.createEl("li", { text: 'Select "External" and click "Create".' });
-    list3.createEl("li", { text: 'Fill in: App Name (Obsidian Sync), User support email (yours), and Developer contact info (yours). Click "Save and Continue".' });
-    list3.createEl("li", { text: 'In "Scopes", click "ADD OR REMOVE SCOPES".' });
-    list3.createEl("li", { text: 'Scroll down to "Manually add scopes" and paste this EXACT string (Required for full sync!):' });
-    step3.createEl("code", { text: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email", style: "display: block; background: #222; padding: 10px; margin: 10px 0; border-radius: 4px; user-select: all; color: #00ff00; font-family: monospace; white-space: pre-wrap; word-break: break-all;" });
-    list3.createEl("li", { text: `Click "ADD TO TABLE", then click "UPDATE". Google WILL show a "Restricted" warning\u2014this is necessary to sync files you didn't create with this plugin. Click "Save and Continue".` });
-    list3.createEl("li", { text: '\u26A0\uFE0F In "Test users", click "ADD USERS" and add your own Gmail address. This is the ONLY way to log in while in testing mode.' });
-    const step4 = contentEl.createEl("div", { cls: "setup-step" });
-    step4.createEl("h3", { text: "4. Get your Keys" });
-    const list4 = step4.createEl("ol");
-    list4.createEl("li", { text: 'Go to "APIs & Services" > "Credentials".' });
-    list4.createEl("li", { text: 'Click "+ Create Credentials" > "OAuth client ID".' });
-    list4.createEl("li", { text: 'Application type: "Web application". Name: "Obsidian Plugin".' });
-    list4.createEl("li", { text: 'Authorized redirect URIs: Add "https://obsidian.md". Click "Create".' });
-    list4.createEl("li", { text: 'Copy the "Client ID" and "Client Secret" into the Obsidian settings.' });
-    const step5 = contentEl.createEl("div", { cls: "setup-step" });
-    step5.createEl("h3", { text: "5. Final Login" });
-    const list5 = step5.createEl("ol");
-    list5.createEl("li", { text: 'In Obsidian settings, click "Open Login Page".' });
-    list5.createEl("li", { text: 'Log in and click "Allow". You will be redirected to obsidian.md.' });
-    list5.createEl("li", { text: 'Look at the address bar. It will have "?code=4/0Af..." in the URL.' });
-    list5.createEl("li", { text: 'Copy EVERYTHING after "code=" and BEFORE the next "&" (if there is one).' });
-    list5.createEl("li", { text: 'Paste it into "Authorization Code" in Obsidian and click "Verify Code".' });
-    contentEl.createEl("p", { text: "\u{1F389} You are now ready to sync!", style: "font-weight: bold; text-align: center; margin-top: 20px;" });
+    contentEl.createEl("h2", { text: "\u{1F680} Google Drive Sync: Full Setup Guide" });
+    contentEl.createEl("p", { text: "Follow these 57 steps to configure your Google Cloud project correctly. This ensures full vault sync (including hidden folders) works perfectly." });
+    const stepsContainer = contentEl.createDiv({ cls: "setup-steps-scroll" });
+    stepsContainer.setAttr("style", "max-height: 70vh; overflow-y: auto; padding-right: 10px; margin-bottom: 20px;");
+    const steps = [
+      "Navigate to https://github.com/Llewellyn500/tether",
+      'Click "Google Cloud Console"',
+      'Click "Select a project"',
+      'Click "New project"',
+      'Type "Tether-Sync"',
+      'Click "Create"',
+      'Click "APIs & Services"',
+      'Click "Library"',
+      'Click the "Search for APIs & Services" field.',
+      'Type "Google drive"',
+      'Click "google drive api"',
+      'Click "Google Drive API"',
+      'Click "Enable"',
+      'Click "OAuth consent screen"',
+      'Click "Get started"',
+      'Click the "App name" field.',
+      'Type "Tether-Sync"',
+      "Click User Support email.",
+      "Click your email address from the dropdown.",
+      'Click "Next"',
+      'Click "External"',
+      'Click "Next"',
+      'Click "Email addresses" (under Developer contact info).',
+      'Click "Next"',
+      'Click the "I agree to the Google API Services: User Data Policy." field.',
+      'Click "Continue"',
+      'Click "Create"',
+      'Click "Data Access"',
+      'Click "Add or remove scopes"',
+      "Manually add the following scope string: https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email",
+      "Press ctrl + c to copy the scope string above.",
+      'Click the "Manually add scopes" field.',
+      "Press ctrl + v to paste the scope string.",
+      'Click "Add to table"',
+      'Click "Update"',
+      'Click "Save"',
+      'Click "Audience"',
+      'Click "Add users"',
+      "Add your own Gmail address as a test user.",
+      'Click "Save"',
+      'Click "Clients"',
+      'Click "Create client"',
+      'Click the "Application type" dropdown.',
+      'Click "Web application"',
+      'Click the "Name" field.',
+      "Press ctrl + a to select existing name.",
+      'Type "Tether Sync"',
+      'Under "Authorized redirect URIs", add: https://obsidian.md',
+      "Press ctrl + c to copy the redirect URI.",
+      "Switch back to the Google Cloud tab.",
+      'Click the "Add URI" button.',
+      'Click the "URIs 1" field.',
+      "Press ctrl + v to paste the redirect URI.",
+      'Click "Create"',
+      'Copy the "Client ID" and paste it into Tether settings.',
+      'Copy the "Client Secret" and paste it into Tether settings.',
+      'Click "OK"'
+    ];
+    steps.forEach((stepText, index) => {
+      const stepDiv = stepsContainer.createDiv({ cls: "setup-step" });
+      stepDiv.setAttr("style", "margin-bottom: 30px; border-bottom: 1px solid #333; padding-bottom: 20px;");
+      stepDiv.createEl("h3", { text: `Step ${index + 1}` });
+      stepDiv.createEl("p", { text: stepText });
+      const img = stepDiv.createEl("img");
+      img.setAttr("src", `images/step-${index + 1}.png`);
+      img.setAttr("alt", `Screenshot for Step ${index + 1}`);
+      img.setAttr("style", "max-width: 100%; border: 1px solid #444; border-radius: 4px; display: block; margin-top: 10px; min-height: 50px; background: #222;");
+      if (index === 29) {
+        const code = stepDiv.createEl("code", {
+          text: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email"
+        });
+        code.setAttr("style", "display: block; background: #111; padding: 10px; margin-top: 10px; color: #4caf50; word-break: break-all;");
+      }
+    });
+    const finalStep = stepsContainer.createDiv({ cls: "setup-step" });
+    finalStep.createEl("h3", { text: "Final Step: Login" });
+    const list = finalStep.createEl("ol");
+    list.createEl("li", { text: 'Go back to Tether settings and click "Open Login Page".' });
+    list.createEl("li", { text: "Log in and you will be redirected to obsidian.md." });
+    list.createEl("li", { text: 'Copy the entire URL from the browser bar and paste it into the "Authorization Code" box in Obsidian.' });
+    const readyText = contentEl.createEl("p", { text: "\u{1F389} You are ready to go!" });
+    readyText.setAttr("style", "font-weight: bold; text-align: center;");
     const btnContainer = contentEl.createDiv({ cls: "modal-button-container" });
     btnContainer.createEl("button", { text: "Got it, let's go!", cls: "mod-cta" }).onClickEvent(() => this.close());
   }

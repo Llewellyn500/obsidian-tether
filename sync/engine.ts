@@ -86,7 +86,8 @@ export class SyncEngine {
 						remoteMap.delete(path);
 					} catch (e) {
 						console.error(`Failed to delete remote ${path}`, e);
-						if (e.message.includes('404')) {
+						// If already deleted or folder is gone, just remove from state
+						if (e.message.includes('404') || e.status === 404) {
 							this.stateManager.remove(path);
 							remoteMap.delete(path);
 						}
@@ -122,6 +123,11 @@ export class SyncEngine {
 					await this.processLocalPath(path, vaultRootDriveId);
 				} catch (e) {
 					console.error(`Failed to push ${path}`, e);
+					// If the file/folder we are trying to update was deleted on remote, 
+					// clear the state so the next sync treats it as a new upload.
+					if (e.message.includes('404') || e.status === 404) {
+						this.stateManager.remove(path);
+					}
 					this.stats.failed++;
 					this.stats.errors.push({ path, message: e.message });
 				}

@@ -143,7 +143,7 @@ export class GoogleDriveClient {
 			body: JSON.stringify(metadata)
 		});
 
-		const uploadUrl = initResponse.headers['location'];
+		const uploadUrl = initResponse.headers['location'] || initResponse.headers['Location'];
 		if (!uploadUrl) throw new Error('Failed to get resumable upload URL');
 
 		const uploadResponse = await this.request({
@@ -164,11 +164,13 @@ export class GoogleDriveClient {
 			url: initUrl,
 			method: 'PATCH',
 			headers: {
+				'Content-Type': 'application/json; charset=UTF-8',
 				'X-Upload-Content-Type': mimeType,
-			}
+			},
+			body: JSON.stringify({})
 		});
 
-		const uploadUrl = initResponse.headers['location'];
+		const uploadUrl = initResponse.headers['location'] || initResponse.headers['Location'];
 		if (!uploadUrl) throw new Error('Failed to get resumable update URL');
 
 		const uploadResponse = await this.request({
