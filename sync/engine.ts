@@ -1,7 +1,7 @@
 import { App, TFile, TFolder, Notice, TAbstractFile } from 'obsidian';
 import { GoogleDriveClient, DriveFile } from './gdrive';
 import { StateManager, SyncEntry } from './state';
-import { SyncStatusView, SyncStats } from '../ui/sync-view';
+import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-view';
 
 export class SyncEngine {
 	app: App;
@@ -9,10 +9,9 @@ export class SyncEngine {
 	stateManager: StateManager;
 	folderId: string;
 	statusBarItem: HTMLElement;
-	view?: SyncStatusView;
 	private folderCache: Map<string, string> = new Map();
 	
-	private stats: SyncStats = {
+	public stats: SyncStats = {
 		totalFiles: 0,
 		processed: 0,
 		failed: 0,
@@ -23,13 +22,12 @@ export class SyncEngine {
 		conflicts: []
 	};
 
-	constructor(app: App, client: GoogleDriveClient, stateManager: StateManager, folderId: string, statusBarItem: HTMLElement, view?: SyncStatusView) {
+	constructor(app: App, client: GoogleDriveClient, stateManager: StateManager, folderId: string, statusBarItem: HTMLElement) {
 		this.app = app;
 		this.client = client;
 		this.stateManager = stateManager;
 		this.folderId = folderId;
 		this.statusBarItem = statusBarItem;
-		this.view = view;
 	}
 
 	updateStatus(text: string, partialStats?: Partial<SyncStats>) {
@@ -38,8 +36,13 @@ export class SyncEngine {
 		if (partialStats) {
 			this.stats = { ...this.stats, ...partialStats };
 		}
-		if (this.view && typeof this.view.updateStats === 'function') {
-			this.view.updateStats(this.stats);
+		
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
+		if (leaves.length > 0) {
+			const view = leaves[0].view as SyncStatusView;
+			if (typeof view.updateStats === 'function') {
+				view.updateStats(this.stats);
+			}
 		}
 	}
 
@@ -332,8 +335,17 @@ export class SyncEngine {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
 					if (remoteTime > stat.mtime) {
 						await this.download(path, remoteFile);
+					} else {
+						// Local is newer. Update state so we don't treat it as a conflict next time.
+						// processLocalPath will handle the upload to remote.
+						this.stateManager.set(path, {
+							driveId: remoteFile.id,
+							lastSyncedMtime: stat.mtime,
+							remoteMtime: remoteFile.modifiedTime,
+							etag: ''
+						});
+						await this.stateManager.save();
 					}
-					// If local is newer, do nothing; processLocalPath will handle the upload
 				} else {
 					await this.handleConflict(path, remoteFile);
 				}
@@ -347,8 +359,15 @@ export class SyncEngine {
 					const remoteTime = new Date(remoteFile.modifiedTime).getTime();
 					if (remoteTime > stat.mtime) {
 						await this.download(path, remoteFile);
+					} else {
+						// Local is newer. We've already verified mtime > lastSyncedMtime.
+						// Update state to match current remote so processLocalPath sees the local change correctly.
+						this.stateManager.set(path, {
+							...state,
+							remoteMtime: remoteFile.modifiedTime
+						});
+						await this.stateManager.save();
 					}
-					// If local is newer, do nothing; processLocalPath will handle the upload
 				} else {
 					await this.handleConflict(path, remoteFile);
 				}

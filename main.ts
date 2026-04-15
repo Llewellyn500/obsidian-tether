@@ -142,10 +142,12 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	setupSyncEngine() {
 		if (!this.settings.folderId) return;
 		
-		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
-		const view = leaves.length > 0 ? (leaves[0].view as SyncStatusView) : undefined;
-		
-		this.syncEngine = new SyncEngine(this.app, this.client, this.stateManager, this.settings.folderId, this.statusBarItem, view);
+		if (!this.syncEngine) {
+			this.syncEngine = new SyncEngine(this.app, this.client, this.stateManager, this.settings.folderId, this.statusBarItem);
+		} else {
+			this.syncEngine.client = this.client;
+			this.syncEngine.folderId = this.settings.folderId;
+		}
 	}
 
 	async saveSettings() {

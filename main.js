@@ -289,9 +289,119 @@ var GoogleDriveClient = class {
 };
 
 // sync/engine.ts
+var import_obsidian4 = require("obsidian");
+
+// ui/sync-view.ts
 var import_obsidian3 = require("obsidian");
+var VIEW_TYPE_SYNC_STATUS = "gdrive-sync-status-view";
+var SyncStatusView = class extends import_obsidian3.ItemView {
+  constructor(leaf) {
+    super(leaf);
+    this.stats = {
+      totalFiles: 0,
+      processed: 0,
+      failed: 0,
+      currentFile: "",
+      status: "Idle",
+      lastSync: "Never",
+      errors: [],
+      conflicts: []
+    };
+  }
+  getViewType() {
+    return VIEW_TYPE_SYNC_STATUS;
+  }
+  getDisplayText() {
+    return "Google Drive Sync";
+  }
+  getIcon() {
+    return "cloud";
+  }
+  async onOpen() {
+    const plugin = this.app.plugins.getPlugin("tether");
+    if (plugin && plugin.syncEngine) {
+      this.stats = { ...plugin.syncEngine.stats };
+    }
+    this.render();
+  }
+  updateStats(newStats) {
+    this.stats = { ...this.stats, ...newStats };
+    this.render();
+  }
+  render() {
+    const container = this.containerEl.children[1];
+    container.empty();
+    container.addClass("gdrive-sync-view");
+    container.createEl("h3", { text: "Sync Status" });
+    const statsGrid = container.createDiv({ cls: "sync-stats-grid" });
+    this.createStat(statsGrid, "Status", this.stats.status);
+    this.createStat(statsGrid, "Progress", `${this.stats.processed} / ${this.stats.totalFiles}`);
+    this.createStat(statsGrid, "Conflicts", this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? "text-warning" : "");
+    this.createStat(statsGrid, "Failed", this.stats.failed.toString(), this.stats.failed > 0 ? "text-error" : "");
+    if (this.stats.currentFile) {
+      container.createEl("p", { text: `Currently: ${this.stats.currentFile}`, cls: "current-file-text" });
+    }
+    if (this.stats.conflicts.length > 0) {
+      container.createEl("h4", { text: "\u{1F6A9} Conflicts (Needs Review)" });
+      const conflictList = container.createDiv({ cls: "sync-conflict-list" });
+      this.stats.conflicts.forEach((conflict) => {
+        const item = conflictList.createDiv({ cls: "conflict-item" });
+        const info = item.createDiv({ cls: "conflict-info" });
+        info.createEl("b", { text: conflict.path.split("/").pop() || conflict.path });
+        info.createEl("p", { text: `Original: ${conflict.originalPath}`, cls: "conflict-original-path" });
+        const btnContainer = item.createDiv({ cls: "conflict-buttons" });
+        const openBtn = btnContainer.createEl("button", { text: "Open", cls: "mod-cta conflict-open-btn" });
+        openBtn.onClickEvent(async () => {
+          try {
+            const file = this.app.vault.getAbstractFileByPath(conflict.path);
+            if (file instanceof import_obsidian3.TFile) {
+              await this.app.workspace.getLeaf(true).openFile(file);
+            } else if (conflict.path.startsWith(".obsidian/")) {
+              new Notice("Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.");
+            } else {
+              await this.app.workspace.openLinkText(conflict.path, "", true);
+            }
+          } catch (e) {
+            console.error("Failed to open conflict file", e);
+            new Notice("Failed to open file: " + e.message);
+          }
+        });
+        const delBtn = btnContainer.createEl("button", { text: "Delete", cls: "mod-warning conflict-del-btn" });
+        delBtn.onClickEvent(async () => {
+          if (confirm(`Are you sure you want to delete this conflict file?
+${conflict.path}`)) {
+            try {
+              await this.app.vault.adapter.remove(conflict.path);
+              this.stats.conflicts = this.stats.conflicts.filter((c) => c.path !== conflict.path);
+              this.render();
+              new Notice("Conflict file deleted.");
+            } catch (e) {
+              new Notice("Failed to delete file: " + e.message);
+            }
+          }
+        });
+      });
+    }
+    if (this.stats.errors.length > 0) {
+      container.createEl("h4", { text: "Recent Errors" });
+      const errorList = container.createDiv({ cls: "sync-error-list" });
+      this.stats.errors.slice(-10).reverse().forEach((err) => {
+        const item = errorList.createDiv({ cls: "error-item" });
+        item.createEl("b", { text: err.path.split("/").pop() || err.path });
+        item.createEl("p", { text: err.message });
+      });
+    }
+  }
+  createStat(parent, label, value, cls = "") {
+    const stat = parent.createDiv({ cls: "sync-stat" });
+    stat.createDiv({ text: label, cls: "stat-label" });
+    stat.createDiv({ text: value, cls: "stat-value " + cls });
+  }
+};
+
+// sync/engine.ts
 var SyncEngine = class {
-  constructor(app, client, stateManager, folderId, statusBarItem, view) {
+  constructor(app, client, stateManager, folderId, statusBarItem) {
     this.folderCache = /* @__PURE__ */ new Map();
     this.stats = {
       totalFiles: 0,
@@ -308,7 +418,6 @@ var SyncEngine = class {
     this.stateManager = stateManager;
     this.folderId = folderId;
     this.statusBarItem = statusBarItem;
-    this.view = view;
   }
   updateStatus(text, partialStats) {
     this.statusBarItem.setText(`\u2601\uFE0F GDrive: ${text}`);
@@ -316,13 +425,17 @@ var SyncEngine = class {
     if (partialStats) {
       this.stats = { ...this.stats, ...partialStats };
     }
-    if (this.view && typeof this.view.updateStats === "function") {
-      this.view.updateStats(this.stats);
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
+    if (leaves.length > 0) {
+      const view = leaves[0].view;
+      if (typeof view.updateStats === "function") {
+        view.updateStats(this.stats);
+      }
     }
   }
   async sync() {
     if (!this.folderId) {
-      new import_obsidian3.Notice("Google Drive folder ID not set.");
+      new import_obsidian4.Notice("Google Drive folder ID not set.");
       return;
     }
     try {
@@ -408,9 +521,9 @@ var SyncEngine = class {
       this.updateStatus("Idle");
       await this.stateManager.save();
       if (this.stats.failed > 0) {
-        new import_obsidian3.Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
+        new import_obsidian4.Notice(`Sync complete with ${this.stats.failed} errors. Check sidebar.`);
       } else {
-        new import_obsidian3.Notice("Sync complete successfully!");
+        new import_obsidian4.Notice("Sync complete successfully!");
       }
     } catch (error) {
       this.updateStatus("Failed");
@@ -559,14 +672,43 @@ var SyncEngine = class {
     const existsLocal = await this.app.vault.adapter.exists(path);
     if (!state) {
       if (existsLocal) {
-        await this.handleConflict(path, remoteFile);
+        const stat = await this.app.vault.adapter.stat(path);
+        if (path.startsWith(".obsidian/") && stat) {
+          const remoteTime = new Date(remoteFile.modifiedTime).getTime();
+          if (remoteTime > stat.mtime) {
+            await this.download(path, remoteFile);
+          } else {
+            this.stateManager.set(path, {
+              driveId: remoteFile.id,
+              lastSyncedMtime: stat.mtime,
+              remoteMtime: remoteFile.modifiedTime,
+              etag: ""
+            });
+            await this.stateManager.save();
+          }
+        } else {
+          await this.handleConflict(path, remoteFile);
+        }
       } else {
         await this.download(path, remoteFile);
       }
     } else if (remoteFile.modifiedTime !== state.remoteMtime) {
       const stat = await this.app.vault.adapter.stat(path);
       if (stat && stat.mtime > state.lastSyncedMtime) {
-        await this.handleConflict(path, remoteFile);
+        if (path.startsWith(".obsidian/")) {
+          const remoteTime = new Date(remoteFile.modifiedTime).getTime();
+          if (remoteTime > stat.mtime) {
+            await this.download(path, remoteFile);
+          } else {
+            this.stateManager.set(path, {
+              ...state,
+              remoteMtime: remoteFile.modifiedTime
+            });
+            await this.stateManager.save();
+          }
+        } else {
+          await this.handleConflict(path, remoteFile);
+        }
       } else {
         await this.download(path, remoteFile);
       }
@@ -618,7 +760,7 @@ var SyncEngine = class {
       await this.ensureLocalPath(folderPath);
     }
     await this.app.vault.adapter.writeBinary(conflictPath, content);
-    new import_obsidian3.Notice(`Conflict detected for ${path}. Kept both versions.`);
+    new import_obsidian4.Notice(`Conflict detected for ${path}. Kept both versions.`);
     this.stats.conflicts.push({
       path: conflictPath,
       originalPath: path,
@@ -650,8 +792,8 @@ var SyncEngine = class {
 };
 
 // ui/folder-modal.ts
-var import_obsidian4 = require("obsidian");
-var FolderSuggestModal = class extends import_obsidian4.Modal {
+var import_obsidian5 = require("obsidian");
+var FolderSuggestModal = class extends import_obsidian5.Modal {
   constructor(app, client, onSelect) {
     super(app);
     this.currentFolderId = "root";
@@ -674,12 +816,12 @@ var FolderSuggestModal = class extends import_obsidian4.Modal {
     try {
       const folders = await this.client.listFolders(this.currentFolderId);
       listEl.empty();
-      new import_obsidian4.Setting(listEl).setName(`\u{1F3AF} Select "${this.currentFolderName}"`).setDesc("Click to use this folder for syncing.").addButton((btn) => btn.setButtonText("Select This Folder").setCta().onClick(() => {
+      new import_obsidian5.Setting(listEl).setName(`\u{1F3AF} Select "${this.currentFolderName}"`).setDesc("Click to use this folder for syncing.").addButton((btn) => btn.setButtonText("Select This Folder").setCta().onClick(() => {
         this.onSelect({ id: this.currentFolderId, name: this.currentFolderName, mimeType: "", modifiedTime: "" });
         this.close();
       }));
       if (this.pathStack.length > 0) {
-        new import_obsidian4.Setting(listEl).setName("\u2B05 Back").addButton((btn) => btn.setButtonText("Go Up").onClick(async () => {
+        new import_obsidian5.Setting(listEl).setName("\u2B05 Back").addButton((btn) => btn.setButtonText("Go Up").onClick(async () => {
           const parent = this.pathStack.pop();
           if (this.pathStack.length === 0) {
             this.currentFolderId = "root";
@@ -692,7 +834,7 @@ var FolderSuggestModal = class extends import_obsidian4.Modal {
           await this.render();
         }));
       }
-      new import_obsidian4.Setting(listEl).setName("++ Create New Sub-Folder ++").addButton((btn) => btn.setButtonText("Create").onClick(() => {
+      new import_obsidian5.Setting(listEl).setName("++ Create New Sub-Folder ++").addButton((btn) => btn.setButtonText("Create").onClick(() => {
         new CreateFolderModal(this.app, this.client, this.currentFolderId, async (newFolder) => {
           await this.render();
         }).open();
@@ -701,7 +843,7 @@ var FolderSuggestModal = class extends import_obsidian4.Modal {
         listEl.createEl("p", { text: "No sub-folders found here.", style: "opacity: 0.6; text-align: center; margin: 20px 0;" });
       }
       folders.forEach((folder) => {
-        new import_obsidian4.Setting(listEl).setName(`\u{1F4C1} ${folder.name}`).addButton((btn) => btn.setButtonText("Open").onClick(async () => {
+        new import_obsidian5.Setting(listEl).setName(`\u{1F4C1} ${folder.name}`).addButton((btn) => btn.setButtonText("Open").onClick(async () => {
           this.pathStack.push({ id: folder.id, name: folder.name });
           this.currentFolderId = folder.id;
           this.currentFolderName = folder.name;
@@ -719,7 +861,7 @@ var FolderSuggestModal = class extends import_obsidian4.Modal {
     contentEl.empty();
   }
 };
-var CreateFolderModal = class extends import_obsidian4.Modal {
+var CreateFolderModal = class extends import_obsidian5.Modal {
   constructor(app, client, parentId, onCreated) {
     super(app);
     this.folderName = "";
@@ -730,19 +872,19 @@ var CreateFolderModal = class extends import_obsidian4.Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.createEl("h2", { text: "Create New Sub-Folder" });
-    new import_obsidian4.Setting(contentEl).setName("Folder Name").addText((text) => text.setPlaceholder("Enter folder name...").onChange((value) => this.folderName = value));
-    new import_obsidian4.Setting(contentEl).addButton((btn) => btn.setButtonText("Create").setCta().onClick(async () => {
+    new import_obsidian5.Setting(contentEl).setName("Folder Name").addText((text) => text.setPlaceholder("Enter folder name...").onChange((value) => this.folderName = value));
+    new import_obsidian5.Setting(contentEl).addButton((btn) => btn.setButtonText("Create").setCta().onClick(async () => {
       if (!this.folderName) {
-        new import_obsidian4.Notice("Please enter a folder name");
+        new import_obsidian5.Notice("Please enter a folder name");
         return;
       }
       try {
         const folder = await this.client.createFolder(this.folderName, this.parentId);
-        new import_obsidian4.Notice(`Folder "${this.folderName}" created`);
+        new import_obsidian5.Notice(`Folder "${this.folderName}" created`);
         this.onCreated(folder);
         this.close();
       } catch (error) {
-        new import_obsidian4.Notice("Failed to create folder: " + error.message);
+        new import_obsidian5.Notice("Failed to create folder: " + error.message);
       }
     }));
   }
@@ -753,8 +895,8 @@ var CreateFolderModal = class extends import_obsidian4.Modal {
 };
 
 // ui/setup-guide.ts
-var import_obsidian5 = require("obsidian");
-var SetupGuideModal = class extends import_obsidian5.Modal {
+var import_obsidian6 = require("obsidian");
+var SetupGuideModal = class extends import_obsidian6.Modal {
   constructor(app) {
     super(app);
   }
@@ -859,112 +1001,6 @@ var SetupGuideModal = class extends import_obsidian5.Modal {
 
 // main.ts
 init_oauth();
-
-// ui/sync-view.ts
-var import_obsidian6 = require("obsidian");
-var VIEW_TYPE_SYNC_STATUS = "gdrive-sync-status-view";
-var SyncStatusView = class extends import_obsidian6.ItemView {
-  constructor(leaf) {
-    super(leaf);
-    this.stats = {
-      totalFiles: 0,
-      processed: 0,
-      failed: 0,
-      currentFile: "",
-      status: "Idle",
-      lastSync: "Never",
-      errors: [],
-      conflicts: []
-    };
-  }
-  getViewType() {
-    return VIEW_TYPE_SYNC_STATUS;
-  }
-  getDisplayText() {
-    return "Google Drive Sync";
-  }
-  getIcon() {
-    return "cloud";
-  }
-  async onOpen() {
-    this.render();
-  }
-  updateStats(newStats) {
-    this.stats = { ...this.stats, ...newStats };
-    this.render();
-  }
-  render() {
-    const container = this.containerEl.children[1];
-    container.empty();
-    container.addClass("gdrive-sync-view");
-    container.createEl("h3", { text: "Sync Status" });
-    const statsGrid = container.createDiv({ cls: "sync-stats-grid" });
-    this.createStat(statsGrid, "Status", this.stats.status);
-    this.createStat(statsGrid, "Progress", `${this.stats.processed} / ${this.stats.totalFiles}`);
-    this.createStat(statsGrid, "Conflicts", this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? "text-warning" : "");
-    this.createStat(statsGrid, "Failed", this.stats.failed.toString(), this.stats.failed > 0 ? "text-error" : "");
-    if (this.stats.currentFile) {
-      container.createEl("p", { text: `Currently: ${this.stats.currentFile}`, cls: "current-file-text" });
-    }
-    if (this.stats.conflicts.length > 0) {
-      container.createEl("h4", { text: "\u{1F6A9} Conflicts (Needs Review)" });
-      const conflictList = container.createDiv({ cls: "sync-conflict-list" });
-      this.stats.conflicts.forEach((conflict) => {
-        const item = conflictList.createDiv({ cls: "conflict-item" });
-        const info = item.createDiv({ cls: "conflict-info" });
-        info.createEl("b", { text: conflict.path.split("/").pop() || conflict.path });
-        info.createEl("p", { text: `Original: ${conflict.originalPath}`, cls: "conflict-original-path" });
-        const btnContainer = item.createDiv({ cls: "conflict-buttons" });
-        const openBtn = btnContainer.createEl("button", { text: "Open", cls: "mod-cta conflict-open-btn" });
-        openBtn.onClickEvent(async () => {
-          try {
-            const file = this.app.vault.getAbstractFileByPath(conflict.path);
-            if (file instanceof import_obsidian6.TFile) {
-              await this.app.workspace.getLeaf(true).openFile(file);
-            } else if (conflict.path.startsWith(".obsidian/")) {
-              new Notice("Cannot open hidden config files directly in the editor. Please use an external editor or a File Explorer plugin to view this file.");
-            } else {
-              await this.app.workspace.openLinkText(conflict.path, "", true);
-            }
-          } catch (e) {
-            console.error("Failed to open conflict file", e);
-            new Notice("Failed to open file: " + e.message);
-          }
-        });
-        const delBtn = btnContainer.createEl("button", { text: "Delete", cls: "mod-warning conflict-del-btn" });
-        delBtn.onClickEvent(async () => {
-          if (confirm(`Are you sure you want to delete this conflict file?
-${conflict.path}`)) {
-            try {
-              await this.app.vault.adapter.remove(conflict.path);
-              this.stats.conflicts = this.stats.conflicts.filter((c) => c.path !== conflict.path);
-              this.render();
-              new Notice("Conflict file deleted.");
-            } catch (e) {
-              new Notice("Failed to delete file: " + e.message);
-            }
-          }
-        });
-      });
-    }
-    if (this.stats.errors.length > 0) {
-      container.createEl("h4", { text: "Recent Errors" });
-      const errorList = container.createDiv({ cls: "sync-error-list" });
-      this.stats.errors.slice(-10).reverse().forEach((err) => {
-        const item = errorList.createDiv({ cls: "error-item" });
-        item.createEl("b", { text: err.path.split("/").pop() || err.path });
-        item.createEl("p", { text: err.message });
-      });
-    }
-  }
-  createStat(parent, label, value, cls = "") {
-    const stat = parent.createDiv({ cls: "sync-stat" });
-    stat.createDiv({ text: label, cls: "stat-label" });
-    stat.createDiv({ text: value, cls: "stat-value " + cls });
-  }
-};
-
-// main.ts
 var DEFAULT_SETTINGS = {
   accessToken: "",
   refreshToken: "",
@@ -1028,6 +1064,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
       leaf = leaves[0];
     } else {
       leaf = workspace.getRightLeaf(false);
+      if (!leaf)
+        return;
       await leaf.setViewState({ type: VIEW_TYPE_SYNC_STATUS, active: true });
     }
     workspace.revealLeaf(leaf);
@@ -1053,9 +1091,12 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
   setupSyncEngine() {
     if (!this.settings.folderId)
       return;
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
-    const view = leaves.length > 0 ? leaves[0].view : void 0;
-    this.syncEngine = new SyncEngine(this.app, this.client, this.stateManager, this.settings.folderId, this.statusBarItem, view);
+    if (!this.syncEngine) {
+      this.syncEngine = new SyncEngine(this.app, this.client, this.stateManager, this.settings.folderId, this.statusBarItem);
+    } else {
+      this.syncEngine.client = this.client;
+      this.syncEngine.folderId = this.settings.folderId;
+    }
   }
   async saveSettings() {
     var _a;
@@ -1094,7 +1135,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
       await this.syncEngine.sync();
     } catch (error) {
       console.error("Sync failed", error);
-      new import_obsidian7.Notice(`Sync failed: ${error.message}`);
+      new import_obsidian7.Notice(`Sync failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.isSyncing = false;
     }
@@ -1139,7 +1180,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian7.Plugin {
       new import_obsidian7.Notice(`Successfully logged in as ${userInfo.email}!`);
     } catch (error) {
       console.error("Login failed", error);
-      new import_obsidian7.Notice("Login failed: " + error.message);
+      new import_obsidian7.Notice("Login failed: " + (error instanceof Error ? error.message : String(error)));
     }
   }
 };
@@ -1202,16 +1243,21 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian7.PluginSettingTab 
     const step3 = containerEl.createEl("div", { cls: "gdrive-setup-step" });
     step3.createEl("h3", { text: "Step 3: Choose Folder" });
     const hasFolder = !!this.plugin.settings.folderId;
-    new import_obsidian7.Setting(step3).setName(hasFolder ? "Folder Selected \u2713" : "Select Sync Folder").setDesc(hasFolder ? `Syncing with: ${this.plugin.settings.folderName}` : "Choose where to sync your notes.").addButton((btn) => btn.setButtonText(hasFolder ? "Change Folder" : "Select Folder").setCta(!hasFolder).onClick(() => {
-      new FolderSuggestModal(this.app, this.plugin.client, async (folder) => {
-        this.plugin.settings.folderId = folder.id;
-        this.plugin.settings.folderName = folder.name;
-        await this.plugin.saveSettings();
-        this.display();
-        new import_obsidian7.Notice(`Sync folder set to ${folder.name}.`);
-        this.plugin.manualSync();
-      }).open();
-    }));
+    new import_obsidian7.Setting(step3).setName(hasFolder ? "Folder Selected \u2713" : "Select Sync Folder").setDesc(hasFolder ? `Syncing with: ${this.plugin.settings.folderName}` : "Choose where to sync your notes.").addButton((btn) => {
+      btn.setButtonText(hasFolder ? "Change Folder" : "Select Folder");
+      if (!hasFolder)
+        btn.setCta();
+      btn.onClick(() => {
+        new FolderSuggestModal(this.app, this.plugin.client, async (folder) => {
+          this.plugin.settings.folderId = folder.id;
+          this.plugin.settings.folderName = folder.name;
+          await this.plugin.saveSettings();
+          this.display();
+          new import_obsidian7.Notice(`Sync folder set to ${folder.name}.`);
+          this.plugin.manualSync();
+        }).open();
+      });
+    });
     if (!hasFolder)
       return;
     const step4 = containerEl.createEl("div", { cls: "gdrive-setup-step" });

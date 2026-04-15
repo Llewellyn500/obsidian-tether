@@ -42,6 +42,10 @@ export class SyncStatusView extends ItemView {
 	}
 
 	async onOpen() {
+		const plugin = (this.app as any).plugins.getPlugin('tether');
+		if (plugin && plugin.syncEngine) {
+			this.stats = { ...plugin.syncEngine.stats };
+		}
 		this.render();
 	}
 
