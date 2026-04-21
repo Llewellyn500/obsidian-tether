@@ -80,8 +80,6 @@ Tether includes a **Setup Wizard** in the settings tab to guide you through thes
 
 9.  Type **"Google drive"**
 
-<img src="images/step-9.png" align="center">
-
 10. Click **"google drive api"**
 
 <img src="images/step-10.png" align="center">
@@ -108,167 +106,95 @@ Tether includes a **Setup Wizard** in the settings tab to guide you through thes
 
 16. Type **"Tether-Sync"**
 
-<img src="images/step-16.png" align="center">
-
 17. Click **User Support email**.
 
 <img src="images/step-17.png" align="center">
 
-18. Click **"your-email@gmail.com"**
+18. Click **your email**
 
-<img src="images/step-18.png" align="center">
-
-19. Click **"Next"**
+19. Click **"External"**
 
 <img src="images/step-19.png" align="center">
 
-20. Click **"External"**
+20. Pick the developer's **"Email address"** (Developer contact info)
 
 <img src="images/step-20.png" align="center">
 
-21. Click **"Next"**
+21. Click the **"I agree to the Google API Services: User Data Policy."** field.
 
-<img src="images/step-21.png" align="center">
-
-22. Click **"Email addresses"** (Developer contact info)
+22. Click the **"create"** button
 
 <img src="images/step-22.png" align="center">
 
-23. Click **"Next"**
+23. Click **"Data Access"**
 
 <img src="images/step-23.png" align="center">
 
-24. Click the **"I agree to the Google API Services: User Data Policy."** field.
+24. Click **"Add or remove scopes"**
 
 <img src="images/step-24.png" align="center">
 
-25. Click **"Continue"**
+25. Copy the scope string: `https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email`
 
-<img src="images/step-25.png" align="center">
-
-26. Click **"Create"**
+26. Paste the string in the **"Manually add scopes"** field.
 
 <img src="images/step-26.png" align="center">
 
-27. Click **"Data Access"**
+27. Click **"Add to table"**
 
 <img src="images/step-27.png" align="center">
 
-28. Click **"Add or remove scopes"**
+28. Click **"Update"**
 
 <img src="images/step-28.png" align="center">
 
-29. Click the scope string: `https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email`
+29. Click **"Save"**
 
 <img src="images/step-29.png" align="center">
 
-30. Press **Ctrl + C** to copy it.
+30. Click **"Audience"**
 
 <img src="images/step-30.png" align="center">
 
-31. Click the **"Manually add scopes"** field.
+31. Click **"Add users"**
 
 <img src="images/step-31.png" align="center">
 
-32. Press **Ctrl + V** to paste the string.
+32. Add your email as a user.
 
-<img src="images/step-32.png" align="center">
-
-33. Click **"Add to table"**
+33. Click **"Clients"**
 
 <img src="images/step-33.png" align="center">
 
-34. Click **"Update"**
+34. Click **"Create client"**
 
 <img src="images/step-34.png" align="center">
 
-35. Click **"Save"**
+35. Choose **"Web application"** as the application type.
 
 <img src="images/step-35.png" align="center">
 
-36. Click **"Audience"**
+36. Type **"Tether Sync"** in the **"Name"** field.
 
 <img src="images/step-36.png" align="center">
 
-37. Click **"Add users"**
+37. Copy the redirect URI: `https://obsidian.md`
 
-<img src="images/step-37.png" align="center">
-
-38. Click the field to add your email.
+38. Click the **"Add URI"** icon.
 
 <img src="images/step-38.png" align="center">
 
-39. Click **"Save"**
+39. Paste the redirect URI in the **"URIs 1"** field.
 
 <img src="images/step-39.png" align="center">
 
-40. Click **"Clients"**
+40. Click **"Create"**
 
-<img src="images/step-40.png" align="center">
+41. Copy the **Client ID** and paste it in Tether's settings.
 
-41. Click **"Create client"**
-
-<img src="images/step-41.png" align="center">
-
-42. Click the **"Application type"** dropdown.
+42. Copy the **Client Secret** and paste it in Tether's settings.
 
 <img src="images/step-42.png" align="center">
-
-43. Click **"Web application"**
-
-<img src="images/step-43.png" align="center">
-
-44. Click the **"Name"** field.
-
-<img src="images/step-44.png" align="center">
-
-45. Press **Ctrl + A** to select all.
-
-<img src="images/step-45.png" align="center">
-
-46. Type **"Tether Sync"**
-
-<img src="images/step-46.png" align="center">
-
-47. Click the redirect URI: `https://obsidian.md`
-
-<img src="images/step-47.png" align="center">
-
-48. Press **Ctrl + C** to copy it.
-
-<img src="images/step-48.png" align="center">
-
-49. Switch back to the **"Create OAuth client ID"** tab.
-
-<img src="images/step-49.png" align="center">
-
-50. Click the **"Add URI"** icon.
-
-<img src="images/step-50.png" align="center">
-
-51. Click the **"URIs 1"** field.
-
-<img src="images/step-51.png" align="center">
-
-52. Press **Ctrl + V** to paste the URI.
-
-<img src="images/step-52.png" align="center">
-
-53. Click **"Create"**
-
-<img src="images/step-53.png" align="center">
-
-54. Click the **"Copy Client ID"** icon.
-
-<img src="images/step-54.png" align="center">
-
-55. Click the **"Copy Client Secret"** icon.
-
-<img src="images/step-55.png" align="center">
-
-56. Click **"OK"** and paste these keys into Tether's settings.
-
-<img src="images/step-56.png" align="center">
 
 ### Step 2: Authentication
 
