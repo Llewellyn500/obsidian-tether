@@ -52,7 +52,7 @@ Until the community listing is live, you can install Tether manually:
 1. Open the Tether settings tab in Obsidian.
 2. Select `Open Guide` if you want the in-app screenshot walkthrough.
 3. Add your Google Cloud `Client ID` and `Client Secret`.
-4. Select `Open Login Page`, sign in with Google, and paste the returned URL or `code=` value into `Authorization Code`.
+4. Select `Open Login Page`, sign in with Google, and paste the returned URL into `Authorization URL`.
 5. Choose the Google Drive folder you want Tether to use.
 6. Run `Sync with Google Drive`.
 
@@ -162,8 +162,8 @@ https://obsidian.md
 2. Select `Open Login Page`.
 3. Sign in to Google.
 4. When you are redirected to `obsidian.md`, copy the full URL or just the `code=` value.
-5. Paste it into `Authorization Code`.
-6. Select `Verify Code`.
+5. Paste it into `Authorization URL`.
+6. Select `Verify Login`.
 
 ### 7. Choose a sync folder
 

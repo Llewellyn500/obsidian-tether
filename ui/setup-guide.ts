@@ -145,7 +145,7 @@ export class SetupGuideModal extends Modal {
 			'In Obsidian settings for Tether, click "Open Login Page".',
 			'Log in with your Google account.',
 			'You will be redirected to obsidian.md. Copy the entire URL from your browser bar.',
-			'Paste that URL into the "Authorization Code" box in Obsidian and click Verify Code.'
+			'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.'
 		];
 		const list = finalStep.createEl('ol');
 		list.setAttr('style', 'padding-left: 22px; line-height: 1.8;');

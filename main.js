@@ -1039,7 +1039,7 @@ var SetupGuideModal = class extends import_obsidian6.Modal {
       'In Obsidian settings for Tether, click "Open Login Page".',
       "Log in with your Google account.",
       "You will be redirected to obsidian.md. Copy the entire URL from your browser bar.",
-      'Paste that URL into the "Authorization Code" box in Obsidian and click Verify Code.'
+      'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.'
     ];
     const list = finalStep.createEl("ol");
     list.setAttr("style", "padding-left: 22px; line-height: 1.8;");
@@ -1289,9 +1289,9 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian7.PluginSettingTab 
       }));
     } else {
       new import_obsidian7.Setting(step2).setName("Authorize Plugin").setDesc("Click to open Google login in your browser.").addButton((btn) => btn.setButtonText("Open Login Page").setCta().onClick(() => this.plugin.startLogin()));
-      new import_obsidian7.Setting(step2).setName("Authorization Code").setDesc('After logging in, copy the "code=" part from the URL and paste it here.').addText((text) => text.setPlaceholder("Paste code here...").onChange((value) => this.authCode = value)).addButton((btn) => btn.setButtonText("Verify Code").onClick(async () => {
+      new import_obsidian7.Setting(step2).setName("Authorization URL").setDesc("After logging in, copy the full redirected URL from your browser and paste it here.").addText((text) => text.setPlaceholder("Paste full URL here...").onChange((value) => this.authCode = value)).addButton((btn) => btn.setButtonText("Verify Login").onClick(async () => {
         if (!this.authCode) {
-          new import_obsidian7.Notice("Please paste the code first.");
+          new import_obsidian7.Notice("Please paste the redirected URL first.");
           return;
         }
         await this.plugin.finalizeLogin(this.authCode);

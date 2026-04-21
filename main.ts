@@ -350,16 +350,16 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 					.onClick(() => this.plugin.startLogin()));
 
 			new Setting(step2)
-				.setName('Authorization Code')
-				.setDesc('After logging in, copy the "code=" part from the URL and paste it here.')
+				.setName('Authorization URL')
+				.setDesc('After logging in, copy the full redirected URL from your browser and paste it here.')
 				.addText(text => text
-					.setPlaceholder('Paste code here...')
+					.setPlaceholder('Paste full URL here...')
 					.onChange(value => this.authCode = value))
 				.addButton(btn => btn
-					.setButtonText('Verify Code')
+					.setButtonText('Verify Login')
 					.onClick(async () => {
 						if (!this.authCode) {
-							new Notice('Please paste the code first.');
+							new Notice('Please paste the redirected URL first.');
 							return;
 						}
 						await this.plugin.finalizeLogin(this.authCode);
