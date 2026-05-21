@@ -1,5 +1,5 @@
 import { App, Modal, Setting, Notice } from 'obsidian';
-import { GoogleDriveClient, DriveFile } from '../sync/gdrive';
+import { GoogleDriveApiError, GoogleDriveClient, DriveFile } from '../sync/gdrive';
 
 export class FolderSuggestModal extends Modal {
 	client: GoogleDriveClient;
@@ -97,9 +97,51 @@ export class FolderSuggestModal extends Modal {
 
 		} catch (error) {
 			listEl.empty();
-			listEl.createEl('p', { text: 'Failed to fetch folders: ' + error.message });
+			this.renderFolderFetchError(listEl, error);
+			new Notice('Failed to fetch Google Drive folders. Check the folder picker for setup steps.');
 			console.error('Folder fetch failed', error);
 		}
+	}
+
+	private renderFolderFetchError(parent: HTMLElement, error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		parent.createEl('p', { text: 'Tether could not load your Google Drive folders.' });
+		parent.createEl('p', { text: message, cls: 'gdrive-folder-error-message' });
+
+		const steps = this.getFolderFetchSteps(error);
+		const list = parent.createEl('ol', { cls: 'gdrive-folder-error-steps' });
+		steps.forEach(step => list.createEl('li', { text: step }));
+
+		new Setting(parent)
+			.setName('Try again')
+			.setDesc('After updating Google Cloud settings, log in again if you changed scopes or tester access.')
+			.addButton(btn => btn
+				.setButtonText('Retry')
+				.setCta()
+				.onClick(() => this.render()));
+	}
+
+	private getFolderFetchSteps(error: unknown): string[] {
+		if (error instanceof GoogleDriveApiError && error.status === 403) {
+			const steps = [
+				'In Google Cloud, confirm the Google Drive API is enabled for the same project that owns this OAuth client.',
+				'Open Google Auth Platform > Data Access and confirm the Drive, Drive metadata, openid, and email scopes are added.',
+				'If the OAuth app is still in Testing, confirm this Google account is listed under Audience > Test users.',
+				'If you changed scopes or test users, log out of Tether and log in again before selecting a folder.'
+			];
+
+			if (error.hint) {
+				return [error.hint, ...steps];
+			}
+
+			return steps;
+		}
+
+		return [
+			'Check your internet connection and try again.',
+			'Confirm the Google Drive API is enabled in Google Cloud.',
+			'Log out of Tether and log in again if you recently changed OAuth settings.'
+		];
 	}
 
 	onClose() {

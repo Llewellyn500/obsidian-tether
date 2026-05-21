@@ -138,3 +138,20 @@
 	font-size: 0.8em;
 	opacity: 0.7;
 }
+
+.gdrive-folder-error-message {
+	background: var(--background-secondary);
+	border-left: 3px solid var(--text-error);
+	padding: 10px;
+	border-radius: 4px;
+	white-space: pre-wrap;
+}
+
+.gdrive-folder-error-steps {
+	margin-top: 12px;
+	padding-left: 22px;
+}
+
+.gdrive-folder-error-steps li {
+	margin-bottom: 8px;
+}

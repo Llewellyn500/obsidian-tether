@@ -172,6 +172,8 @@ export class SetupGuideModal extends Modal {
 			'Log in with your Google account.',
 			'You will be redirected to Tether\'s callback page. Copy the full URL shown there.',
 			'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.',
+			'If Select Folder shows a 403 error, confirm Google Drive API is enabled, the required Drive scopes are added, and this Google account is added under Audience > Test users if the app is still in Testing.',
+			'If you changed API access, scopes, or test users after logging in, log out of Tether and log in again before selecting a folder.',
 			'After your first successful login, return to Audience in Google Cloud and publish the app to In production to avoid weekly re-logins.',
 			'After changing the publishing status, log in to Tether again so Google issues a fresh refresh token.'
 		];

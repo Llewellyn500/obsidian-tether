@@ -22,6 +22,20 @@ export class SessionExpiredError extends Error {
 	}
 }
 
+export class GoogleDriveApiError extends Error {
+	status: number;
+	reason?: string;
+	hint?: string;
+
+	constructor(status: number, message: string, reason?: string, hint?: string) {
+		super(message);
+		this.name = 'GoogleDriveApiError';
+		this.status = status;
+		this.reason = reason;
+		this.hint = hint;
+	}
+}
+
 export function isSessionExpiredError(error: unknown): boolean {
 	return error instanceof SessionExpiredError ||
 		(error instanceof Error && error.name === 'SessionExpiredError');
@@ -40,14 +54,18 @@ export class GoogleDriveClient {
 	}
 
 	private async request(options: RequestUrlParam, retry: boolean = true): Promise<any> {
-		options.headers = {
-			...options.headers,
-			'Authorization': `Bearer ${this.accessToken}`
+		const requestOptions: RequestUrlParam = {
+			...options,
+			throw: false,
+			headers: {
+				...options.headers,
+				'Authorization': `Bearer ${this.accessToken}`
+			}
 		};
 		
 		let response;
 		try {
-			response = await requestUrl(options);
+			response = await requestUrl(requestOptions);
 		} catch (error: unknown) {
 			const status = typeof error === 'object' && error !== null && 'status' in error
 				? (error as { status?: number }).status
@@ -55,7 +73,7 @@ export class GoogleDriveClient {
 			if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
 				return await this.handleRefresh(options);
 			}
-			throw error;
+			throw this.toApiError(error);
 		}
 		
 		if (response.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
@@ -63,18 +81,7 @@ export class GoogleDriveClient {
 		}
 
 		if (response.status >= 400) {
-			let message = response.text || `Status ${response.status}`;
-			try {
-				const json = JSON.parse(response.text);
-				if (json.error && json.error.message) {
-					message = json.error.message;
-				}
-			} catch (e) {
-				// Not JSON or missing message
-			}
-			const error: any = new Error(`Google Drive API Error: ${message}`);
-			error.status = response.status;
-			throw error;
+			throw this.toApiError(response);
 		}
 		return response;
 	}
@@ -129,6 +136,62 @@ export class GoogleDriveClient {
 		if (tokens.refresh_token && this.refreshParams) {
 			this.refreshParams.refreshToken = tokens.refresh_token;
 		}
+	}
+
+	private toApiError(errorOrResponse: unknown): GoogleDriveApiError {
+		const input = typeof errorOrResponse === 'object' && errorOrResponse !== null
+			? errorOrResponse as Record<string, any>
+			: {};
+		const status = typeof input.status === 'number' ? input.status : 0;
+		const text = typeof input.text === 'string' ? input.text : '';
+		const json = input.json || this.parseJson(text);
+		const googleError = json?.error;
+		const detail = Array.isArray(googleError?.errors) ? googleError.errors[0] : undefined;
+		const reason = detail?.reason || googleError?.status || googleError?.code;
+		const message = googleError?.message ||
+			detail?.message ||
+			(errorOrResponse instanceof Error ? errorOrResponse.message : '') ||
+			text ||
+			`Request failed, status ${status || 'unknown'}`;
+		const hint = this.getApiErrorHint(status, reason, message);
+
+		return new GoogleDriveApiError(status, `Google Drive API Error: ${message}`, reason, hint);
+	}
+
+	private parseJson(text: string): any {
+		if (!text) return null;
+		try {
+			return JSON.parse(text);
+		} catch (e) {
+			return null;
+		}
+	}
+
+	private getApiErrorHint(status: number, reason: string | undefined, message: string): string | undefined {
+		const normalizedReason = (reason || '').toLowerCase();
+		const normalizedMessage = message.toLowerCase();
+
+		if (status === 403 && (
+			normalizedReason.includes('accessnotconfigured') ||
+			normalizedMessage.includes('api has not been used') ||
+			normalizedMessage.includes('it is disabled')
+		)) {
+			return 'Enable the Google Drive API in the same Google Cloud project used for this OAuth client, then wait a few minutes and try again.';
+		}
+
+		if (status === 403 && (
+			normalizedReason.includes('insufficientpermissions') ||
+			normalizedMessage.includes('insufficient authentication scopes') ||
+			normalizedMessage.includes('insufficient permission')
+		)) {
+			return 'Add the required Drive scopes in Google Cloud Data Access, then log out of Tether and log in again so Google grants a new token.';
+		}
+
+		if (status === 403) {
+			return 'Check that the Drive API is enabled, the required Drive scopes are added, this Google account is allowed to test the app if it is still in Testing, and then log in to Tether again.';
+		}
+
+		return undefined;
 	}
 
 	async listFiles(folderId: string): Promise<DriveFile[]> {

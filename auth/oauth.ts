@@ -100,7 +100,8 @@ export class OAuthManager {
 				url: 'https://oauth2.googleapis.com/token',
 				method: 'POST',
 				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-				body: body.toString()
+				body: body.toString(),
+				throw: false
 			});
 		} catch (error) {
 			throw this.toTokenError(error);

@@ -63,6 +63,20 @@
 				If Google requires additional verification, complete the requested Google verification steps. Publishing to production avoids the normal 7-day Testing refresh-token expiry, but unverified apps may still show Google's warning screen or user cap.
 			</div>
 		</section>
+
+		<section class="section">
+			<div class="section-header">
+				<h2>Folder Picker 403 Checklist</h2>
+				<p>If login succeeds but Tether cannot load Google Drive folders, Google is denying the Drive API request. Check these items in the same Google Cloud project that owns the OAuth client.</p>
+			</div>
+			<ol class="value-list">
+				<li>Open APIs & Services > Library and confirm Google Drive API is enabled.</li>
+				<li>Open Google Auth Platform > Data Access and confirm the Drive, Drive metadata, openid, and email scopes are added.</li>
+				<li>If the app is still in Testing, open Audience and confirm the user's Google account is listed as a test user.</li>
+				<li>If scopes or tester access changed after login, log out of Tether and log in again before selecting a folder.</li>
+				<li>For Google Workspace accounts, ask the workspace admin whether third-party Drive apps are blocked.</li>
+			</ol>
+		</section>
 	</main>
 
 	<footer class="site-footer">

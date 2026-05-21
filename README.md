@@ -213,6 +213,21 @@ https://llewellyn500.github.io/obsidian-tether/oauth/callback.html
 2. Pick an existing Google Drive folder or create a new one.
 3. Tether will create a subfolder named after your vault inside that folder.
 
+### Troubleshooting folder picker 403 errors
+
+If login succeeds but `Select Folder` fails with `Google Drive API Error` or `status 403`, check these items in the same Google Cloud project that owns your OAuth client:
+
+1. Open `APIs & Services` > `Library` and confirm `Google Drive API` is enabled.
+2. Open `Google Auth Platform` > `Data Access` and confirm these scopes are added:
+
+```text
+https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email
+```
+
+3. If the OAuth app is still in `Testing`, open `Audience` and confirm the user's Google account is added as a test user.
+4. If you changed scopes, test users, or API enablement after the user already logged in, have them log out of Tether and log in again before selecting a folder.
+5. If this is a Google Workspace account, an admin policy may block third-party Drive apps until the app is allowed by the workspace admin.
+
 </details>
 
 ## Support

@@ -168,7 +168,8 @@ var OAuthManager = class {
         url: "https://oauth2.googleapis.com/token",
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body.toString()
+        body: body.toString(),
+        throw: false
       });
     } catch (error) {
       throw this.toTokenError(error);
@@ -219,6 +220,15 @@ var SessionExpiredError = class extends Error {
     this.name = "SessionExpiredError";
   }
 };
+var GoogleDriveApiError = class extends Error {
+  constructor(status, message, reason, hint) {
+    super(message);
+    this.name = "GoogleDriveApiError";
+    this.status = status;
+    this.reason = reason;
+    this.hint = hint;
+  }
+};
 function isSessionExpiredError(error) {
   return error instanceof SessionExpiredError || error instanceof Error && error.name === "SessionExpiredError";
 }
@@ -229,35 +239,29 @@ var GoogleDriveClient = class {
     this.refreshParams = refreshParams;
   }
   async request(options, retry = true) {
-    options.headers = {
-      ...options.headers,
-      "Authorization": `Bearer ${this.accessToken}`
+    const requestOptions = {
+      ...options,
+      throw: false,
+      headers: {
+        ...options.headers,
+        "Authorization": `Bearer ${this.accessToken}`
+      }
     };
     let response;
     try {
-      response = await (0, import_obsidian3.requestUrl)(options);
+      response = await (0, import_obsidian3.requestUrl)(requestOptions);
     } catch (error) {
       const status = typeof error === "object" && error !== null && "status" in error ? error.status : void 0;
       if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
         return await this.handleRefresh(options);
       }
-      throw error;
+      throw this.toApiError(error);
     }
     if (response.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
       return await this.handleRefresh(options);
     }
     if (response.status >= 400) {
-      let message = response.text || `Status ${response.status}`;
-      try {
-        const json = JSON.parse(response.text);
-        if (json.error && json.error.message) {
-          message = json.error.message;
-        }
-      } catch (e) {
-      }
-      const error = new Error(`Google Drive API Error: ${message}`);
-      error.status = response.status;
-      throw error;
+      throw this.toApiError(response);
     }
     return response;
   }
@@ -299,6 +303,41 @@ var GoogleDriveClient = class {
     if (tokens.refresh_token && this.refreshParams) {
       this.refreshParams.refreshToken = tokens.refresh_token;
     }
+  }
+  toApiError(errorOrResponse) {
+    const input = typeof errorOrResponse === "object" && errorOrResponse !== null ? errorOrResponse : {};
+    const status = typeof input.status === "number" ? input.status : 0;
+    const text = typeof input.text === "string" ? input.text : "";
+    const json = input.json || this.parseJson(text);
+    const googleError = json == null ? void 0 : json.error;
+    const detail = Array.isArray(googleError == null ? void 0 : googleError.errors) ? googleError.errors[0] : void 0;
+    const reason = (detail == null ? void 0 : detail.reason) || (googleError == null ? void 0 : googleError.status) || (googleError == null ? void 0 : googleError.code);
+    const message = (googleError == null ? void 0 : googleError.message) || (detail == null ? void 0 : detail.message) || (errorOrResponse instanceof Error ? errorOrResponse.message : "") || text || `Request failed, status ${status || "unknown"}`;
+    const hint = this.getApiErrorHint(status, reason, message);
+    return new GoogleDriveApiError(status, `Google Drive API Error: ${message}`, reason, hint);
+  }
+  parseJson(text) {
+    if (!text)
+      return null;
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return null;
+    }
+  }
+  getApiErrorHint(status, reason, message) {
+    const normalizedReason = (reason || "").toLowerCase();
+    const normalizedMessage = message.toLowerCase();
+    if (status === 403 && (normalizedReason.includes("accessnotconfigured") || normalizedMessage.includes("api has not been used") || normalizedMessage.includes("it is disabled"))) {
+      return "Enable the Google Drive API in the same Google Cloud project used for this OAuth client, then wait a few minutes and try again.";
+    }
+    if (status === 403 && (normalizedReason.includes("insufficientpermissions") || normalizedMessage.includes("insufficient authentication scopes") || normalizedMessage.includes("insufficient permission"))) {
+      return "Add the required Drive scopes in Google Cloud Data Access, then log out of Tether and log in again so Google grants a new token.";
+    }
+    if (status === 403) {
+      return "Check that the Drive API is enabled, the required Drive scopes are added, this Google account is allowed to test the app if it is still in Testing, and then log in to Tether again.";
+    }
+    return void 0;
   }
   async listFiles(folderId) {
     let files = [];
@@ -1396,9 +1435,38 @@ var FolderSuggestModal = class extends import_obsidian6.Modal {
       });
     } catch (error) {
       listEl.empty();
-      listEl.createEl("p", { text: "Failed to fetch folders: " + error.message });
+      this.renderFolderFetchError(listEl, error);
+      new import_obsidian6.Notice("Failed to fetch Google Drive folders. Check the folder picker for setup steps.");
       console.error("Folder fetch failed", error);
     }
+  }
+  renderFolderFetchError(parent, error) {
+    const message = error instanceof Error ? error.message : String(error);
+    parent.createEl("p", { text: "Tether could not load your Google Drive folders." });
+    parent.createEl("p", { text: message, cls: "gdrive-folder-error-message" });
+    const steps = this.getFolderFetchSteps(error);
+    const list = parent.createEl("ol", { cls: "gdrive-folder-error-steps" });
+    steps.forEach((step) => list.createEl("li", { text: step }));
+    new import_obsidian6.Setting(parent).setName("Try again").setDesc("After updating Google Cloud settings, log in again if you changed scopes or tester access.").addButton((btn) => btn.setButtonText("Retry").setCta().onClick(() => this.render()));
+  }
+  getFolderFetchSteps(error) {
+    if (error instanceof GoogleDriveApiError && error.status === 403) {
+      const steps = [
+        "In Google Cloud, confirm the Google Drive API is enabled for the same project that owns this OAuth client.",
+        "Open Google Auth Platform > Data Access and confirm the Drive, Drive metadata, openid, and email scopes are added.",
+        "If the OAuth app is still in Testing, confirm this Google account is listed under Audience > Test users.",
+        "If you changed scopes or test users, log out of Tether and log in again before selecting a folder."
+      ];
+      if (error.hint) {
+        return [error.hint, ...steps];
+      }
+      return steps;
+    }
+    return [
+      "Check your internet connection and try again.",
+      "Confirm the Google Drive API is enabled in Google Cloud.",
+      "Log out of Tether and log in again if you recently changed OAuth settings."
+    ];
   }
   onClose() {
     const { contentEl } = this;
@@ -1567,6 +1635,8 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
       "Log in with your Google account.",
       "You will be redirected to Tether's callback page. Copy the full URL shown there.",
       'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.',
+      "If Select Folder shows a 403 error, confirm Google Drive API is enabled, the required Drive scopes are added, and this Google account is added under Audience > Test users if the app is still in Testing.",
+      "If you changed API access, scopes, or test users after logging in, log out of Tether and log in again before selecting a folder.",
       "After your first successful login, return to Audience in Google Cloud and publish the app to In production to avoid weekly re-logins.",
       "After changing the publishing status, log in to Tether again so Google issues a fresh refresh token."
     ];
