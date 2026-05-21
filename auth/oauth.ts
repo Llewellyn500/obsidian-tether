@@ -134,6 +134,14 @@ export class OAuthManager {
 		const description = typeof json?.error_description === 'string' ? json.error_description : undefined;
 		const fallback = error instanceof Error ? error.message : String(error);
 
+		if (code === 'redirect_uri_mismatch') {
+			return new OAuthTokenError(
+				`Redirect URI mismatch. In Google Cloud Console → Credentials → your OAuth client, add this exact Authorized redirect URI: ${REDIRECT_URI}`,
+				code,
+				status
+			);
+		}
+
 		return new OAuthTokenError(description || code || fallback, code, status);
 	}
 

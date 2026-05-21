@@ -11,6 +11,8 @@ const STATE_SAVE_INTERVAL_MS = 10000;
 const MANUAL_STATUS_UPDATE_MS = 500;
 const BACKGROUND_STATUS_UPDATE_MS = 3000;
 const WORK_YIELD_ITEM_LIMIT = 25;
+const CATASTROPHIC_DELETE_RATIO = 0.8;
+const CATASTROPHIC_DELETE_MIN_TRACKED = 10;
 
 export type SyncMode = 'pull' | 'push';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
@@ -655,31 +657,49 @@ export class SyncEngine {
 		const stateEntries = Object.entries(this.stateManager.state);
 		const locallyDeletedPaths = new Set<string>();
 
+		// Collect candidates for deletion first
+		const deletionCandidates: [string, typeof stateEntries[0][1]][] = [];
+		const trackedCount = stateEntries.filter(([p]) => p !== '__VAULT_ROOT__' && !this.isExcluded(p)).length;
+
 		for (const [path, entry] of stateEntries) {
 			if (path === '__VAULT_ROOT__' || this.isExcluded(path)) continue;
-
 			if (!localPathSet.has(path)) {
-				try {
-					this.updateStatus(`Deleting remote: ${path}`);
-					await this.client.deleteFile(entry.driveId);
+				deletionCandidates.push([path, entry]);
+			}
+		}
+
+		// Safeguard: abort if deleting too many remote files at once
+		if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED &&
+			deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+			const msg = `Push aborted: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No remote files were deleted.`;
+			console.error(msg);
+			new Notice(msg);
+			this.stats.failed++;
+			this.stats.errors.push({ path: 'Remote deletions', message: msg });
+			return locallyDeletedPaths;
+		}
+
+		for (const [path, entry] of deletionCandidates) {
+			try {
+				this.updateStatus(`Deleting remote: ${path}`);
+				await this.client.deleteFile(entry.driveId);
+				this.stateManager.remove(path);
+				locallyDeletedPaths.add(path);
+				await this.flushStateIfNeeded();
+			} catch (e) {
+				if (isSessionExpiredError(e)) throw e;
+				if (this.isNotFound(e)) {
 					this.stateManager.remove(path);
 					locallyDeletedPaths.add(path);
 					await this.flushStateIfNeeded();
-				} catch (e) {
-					if (isSessionExpiredError(e)) throw e;
-					if (this.isNotFound(e)) {
-						this.stateManager.remove(path);
-						locallyDeletedPaths.add(path);
-						await this.flushStateIfNeeded();
-					} else {
-						console.error(`Failed to delete remote ${path}`, e);
-						this.stats.failed++;
-						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-					}
+				} else {
+					console.error(`Failed to delete remote ${path}`, e);
+					this.stats.failed++;
+					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 				}
-
-				await this.afterWorkItem();
 			}
+
+			await this.afterWorkItem();
 		}
 
 		return locallyDeletedPaths;
@@ -692,52 +712,65 @@ export class SyncEngine {
 			.filter(([path]) => path !== '__VAULT_ROOT__' && !this.isExcluded(path))
 			.sort((a, b) => b[0].length - a[0].length);
 
-		for (const [path, entry] of sortedEntries) {
-			if (!remotePathSet.has(path)) {
-				try {
-					if (await this.app.vault.adapter.exists(path)) {
-						this.updateStatus(`Deleting local: ${path}`);
-						const stat = await this.app.vault.adapter.stat(path);
-						if (stat?.type === 'file' && this.isOpenFilePath(path)) {
-							this.addDeferredFile(path, 'open in Obsidian');
-							continue;
-						}
+		// Collect candidates for deletion
+		const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
+		const trackedCount = sortedEntries.length;
 
-						if (stat?.type === 'file' && stat.mtime > entry.lastSyncedMtime) {
-							if (await this.shouldDeferActiveLocalFile(path, stat)) {
-								this.stateManager.remove(path);
-								continue;
-							}
+		// Safeguard: abort if deleting too many local files at once
+		if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED &&
+			deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+			const msg = `Pull aborted deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No local files were deleted.`;
+			console.error(msg);
+			new Notice(msg);
+			this.stats.failed++;
+			this.stats.errors.push({ path: 'Local deletions', message: msg });
+			return;
+		}
 
+		for (const [path, entry] of deletionCandidates) {
+			try {
+				if (await this.app.vault.adapter.exists(path)) {
+					this.updateStatus(`Deleting local: ${path}`);
+					const stat = await this.app.vault.adapter.stat(path);
+					if (stat?.type === 'file' && this.isOpenFilePath(path)) {
+						this.addDeferredFile(path, 'open in Obsidian');
+						continue;
+					}
+
+					if (stat?.type === 'file' && stat.mtime > entry.lastSyncedMtime) {
+						if (await this.shouldDeferActiveLocalFile(path, stat)) {
 							this.stateManager.remove(path);
 							continue;
 						}
-						if (stat?.type === 'folder') {
-							if (await this.hasUnsyncedLocalDescendant(path)) {
-								this.stateManager.remove(path);
-								continue;
-							}
 
-							// Use rmdir for folders. Recursive: false because we handle children individually
-							// due to the sorted loop.
-							await this.app.vault.adapter.rmdir(path, false).catch(async () => {
-								// If rmdir fails because it's not empty (shouldn't happen with our sorting, 
-								// but safety first), try recursive if it's not a critical folder.
-								if (!this.isConfigPath(path)) {
-									await this.app.vault.adapter.rmdir(path, true);
-								}
-							});
-						} else {
-							await this.app.vault.adapter.remove(path);
-						}
+						this.stateManager.remove(path);
+						continue;
 					}
-					this.stateManager.remove(path);
-					await this.flushStateIfNeeded();
-				} catch (e) {
-					console.error(`Failed to delete local ${path}`, e);
-					this.stats.failed++;
-					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+					if (stat?.type === 'folder') {
+						if (await this.hasUnsyncedLocalDescendant(path)) {
+							this.stateManager.remove(path);
+							continue;
+						}
+
+						// Use rmdir for folders. Recursive: false because we handle children individually
+						// due to the sorted loop.
+						await this.app.vault.adapter.rmdir(path, false).catch(async () => {
+							// If rmdir fails because it's not empty (shouldn't happen with our sorting, 
+							// but safety first), try recursive if it's not a critical folder.
+							if (!this.isConfigPath(path)) {
+								await this.app.vault.adapter.rmdir(path, true);
+							}
+						});
+					} else {
+						await this.app.vault.adapter.remove(path);
+					}
 				}
+				this.stateManager.remove(path);
+				await this.flushStateIfNeeded();
+			} catch (e) {
+				console.error(`Failed to delete local ${path}`, e);
+				this.stats.failed++;
+				this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 			}
 		}
 	}

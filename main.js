@@ -196,6 +196,9 @@ var OAuthManager = class {
     const code = typeof (json == null ? void 0 : json.error) === "string" ? json.error : void 0;
     const description = typeof (json == null ? void 0 : json.error_description) === "string" ? json.error_description : void 0;
     const fallback = error instanceof Error ? error.message : String(error);
+    if (code === "redirect_uri_mismatch") {
+      return new OAuthTokenError(`Redirect URI mismatch. In Google Cloud Console \u2192 Credentials \u2192 your OAuth client, add this exact Authorized redirect URI: ${REDIRECT_URI}`, code, status);
+    }
     return new OAuthTokenError(description || code || fallback, code, status);
   }
   static parseJson(text) {
@@ -587,6 +590,8 @@ var STATE_SAVE_INTERVAL_MS = 1e4;
 var MANUAL_STATUS_UPDATE_MS = 500;
 var BACKGROUND_STATUS_UPDATE_MS = 3e3;
 var WORK_YIELD_ITEM_LIMIT = 25;
+var CATASTROPHIC_DELETE_RATIO = 0.8;
+var CATASTROPHIC_DELETE_MIN_TRACKED = 10;
 var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
@@ -1122,76 +1127,97 @@ var SyncEngine = class {
     this.updateStatus("Checking for deletions...");
     const stateEntries = Object.entries(this.stateManager.state);
     const locallyDeletedPaths = /* @__PURE__ */ new Set();
+    const deletionCandidates = [];
+    const trackedCount = stateEntries.filter(([p]) => p !== "__VAULT_ROOT__" && !this.isExcluded(p)).length;
     for (const [path, entry] of stateEntries) {
       if (path === "__VAULT_ROOT__" || this.isExcluded(path))
         continue;
       if (!localPathSet.has(path)) {
-        try {
-          this.updateStatus(`Deleting remote: ${path}`);
-          await this.client.deleteFile(entry.driveId);
+        deletionCandidates.push([path, entry]);
+      }
+    }
+    if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+      const msg = `Push aborted: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No remote files were deleted.`;
+      console.error(msg);
+      new import_obsidian5.Notice(msg);
+      this.stats.failed++;
+      this.stats.errors.push({ path: "Remote deletions", message: msg });
+      return locallyDeletedPaths;
+    }
+    for (const [path, entry] of deletionCandidates) {
+      try {
+        this.updateStatus(`Deleting remote: ${path}`);
+        await this.client.deleteFile(entry.driveId);
+        this.stateManager.remove(path);
+        locallyDeletedPaths.add(path);
+        await this.flushStateIfNeeded();
+      } catch (e) {
+        if (isSessionExpiredError(e))
+          throw e;
+        if (this.isNotFound(e)) {
           this.stateManager.remove(path);
           locallyDeletedPaths.add(path);
           await this.flushStateIfNeeded();
-        } catch (e) {
-          if (isSessionExpiredError(e))
-            throw e;
-          if (this.isNotFound(e)) {
-            this.stateManager.remove(path);
-            locallyDeletedPaths.add(path);
-            await this.flushStateIfNeeded();
-          } else {
-            console.error(`Failed to delete remote ${path}`, e);
-            this.stats.failed++;
-            this.stats.errors.push({ path, message: this.getErrorMessage(e) });
-          }
+        } else {
+          console.error(`Failed to delete remote ${path}`, e);
+          this.stats.failed++;
+          this.stats.errors.push({ path, message: this.getErrorMessage(e) });
         }
-        await this.afterWorkItem();
       }
+      await this.afterWorkItem();
     }
     return locallyDeletedPaths;
   }
   async handleRemoteDeletions(remotePathSet) {
     const stateEntries = Object.entries(this.stateManager.state);
     const sortedEntries = stateEntries.filter(([path]) => path !== "__VAULT_ROOT__" && !this.isExcluded(path)).sort((a, b) => b[0].length - a[0].length);
-    for (const [path, entry] of sortedEntries) {
-      if (!remotePathSet.has(path)) {
-        try {
-          if (await this.app.vault.adapter.exists(path)) {
-            this.updateStatus(`Deleting local: ${path}`);
-            const stat = await this.app.vault.adapter.stat(path);
-            if ((stat == null ? void 0 : stat.type) === "file" && this.isOpenFilePath(path)) {
-              this.addDeferredFile(path, "open in Obsidian");
-              continue;
-            }
-            if ((stat == null ? void 0 : stat.type) === "file" && stat.mtime > entry.lastSyncedMtime) {
-              if (await this.shouldDeferActiveLocalFile(path, stat)) {
-                this.stateManager.remove(path);
-                continue;
-              }
+    const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
+    const trackedCount = sortedEntries.length;
+    if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+      const msg = `Pull aborted deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No local files were deleted.`;
+      console.error(msg);
+      new import_obsidian5.Notice(msg);
+      this.stats.failed++;
+      this.stats.errors.push({ path: "Local deletions", message: msg });
+      return;
+    }
+    for (const [path, entry] of deletionCandidates) {
+      try {
+        if (await this.app.vault.adapter.exists(path)) {
+          this.updateStatus(`Deleting local: ${path}`);
+          const stat = await this.app.vault.adapter.stat(path);
+          if ((stat == null ? void 0 : stat.type) === "file" && this.isOpenFilePath(path)) {
+            this.addDeferredFile(path, "open in Obsidian");
+            continue;
+          }
+          if ((stat == null ? void 0 : stat.type) === "file" && stat.mtime > entry.lastSyncedMtime) {
+            if (await this.shouldDeferActiveLocalFile(path, stat)) {
               this.stateManager.remove(path);
               continue;
             }
-            if ((stat == null ? void 0 : stat.type) === "folder") {
-              if (await this.hasUnsyncedLocalDescendant(path)) {
-                this.stateManager.remove(path);
-                continue;
-              }
-              await this.app.vault.adapter.rmdir(path, false).catch(async () => {
-                if (!this.isConfigPath(path)) {
-                  await this.app.vault.adapter.rmdir(path, true);
-                }
-              });
-            } else {
-              await this.app.vault.adapter.remove(path);
-            }
+            this.stateManager.remove(path);
+            continue;
           }
-          this.stateManager.remove(path);
-          await this.flushStateIfNeeded();
-        } catch (e) {
-          console.error(`Failed to delete local ${path}`, e);
-          this.stats.failed++;
-          this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+          if ((stat == null ? void 0 : stat.type) === "folder") {
+            if (await this.hasUnsyncedLocalDescendant(path)) {
+              this.stateManager.remove(path);
+              continue;
+            }
+            await this.app.vault.adapter.rmdir(path, false).catch(async () => {
+              if (!this.isConfigPath(path)) {
+                await this.app.vault.adapter.rmdir(path, true);
+              }
+            });
+          } else {
+            await this.app.vault.adapter.remove(path);
+          }
         }
+        this.stateManager.remove(path);
+        await this.flushStateIfNeeded();
+      } catch (e) {
+        console.error(`Failed to delete local ${path}`, e);
+        this.stats.failed++;
+        this.stats.errors.push({ path, message: this.getErrorMessage(e) });
       }
     }
   }
@@ -1773,7 +1799,14 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
   }
   async manualSync() {
-    await this.runSync(this.settings.initialPullComplete ? "push" : "pull");
+    if (!this.settings.initialPullComplete) {
+      await this.runSync("pull");
+      if (this.settings.initialPullComplete && !this.isSyncing) {
+        await this.runSync("push");
+      }
+    } else {
+      await this.runSync("push");
+    }
   }
   async pullSync() {
     await this.runSync("pull");
@@ -1828,7 +1861,14 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       return;
     if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS)
       return;
-    await this.runSync(this.settings.initialPullComplete ? "push" : "pull", { silent: true, revealStatus: false });
+    if (!this.settings.initialPullComplete) {
+      await this.runSync("pull", { silent: true, revealStatus: false });
+      if (this.settings.initialPullComplete && !this.isSyncing) {
+        await this.runSync("push", { silent: true, revealStatus: false });
+      }
+    } else {
+      await this.runSync("push", { silent: true, revealStatus: false });
+    }
   }
   async startLogin() {
     if (!this.settings.clientId || !this.settings.clientSecret) {

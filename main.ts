@@ -287,7 +287,16 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async manualSync() {
-		await this.runSync(this.settings.initialPullComplete ? 'push' : 'pull');
+		if (!this.settings.initialPullComplete) {
+			// First pull from remote to pick up any existing files
+			await this.runSync('pull');
+			// After a successful initial pull, immediately push local content
+			if (this.settings.initialPullComplete && !this.isSyncing) {
+				await this.runSync('push');
+			}
+		} else {
+			await this.runSync('push');
+		}
 	}
 
 	async pullSync() {
@@ -346,7 +355,15 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
 		if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS) return;
 
-		await this.runSync(this.settings.initialPullComplete ? 'push' : 'pull', { silent: true, revealStatus: false });
+		if (!this.settings.initialPullComplete) {
+			await this.runSync('pull', { silent: true, revealStatus: false });
+			// After a successful initial pull, immediately push local content
+			if (this.settings.initialPullComplete && !this.isSyncing) {
+				await this.runSync('push', { silent: true, revealStatus: false });
+			}
+		} else {
+			await this.runSync('push', { silent: true, revealStatus: false });
+		}
 	}
 
 	async startLogin() {
