@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Tether - Google Drive sync for Obsidian</title>
+	<meta name="description" content="Tether is an Obsidian plugin that syncs a vault with Google Drive using the user's own Google Cloud OAuth project.">
+	<link rel="icon" href="assets/tether-google-cloud-logo.png">
+	<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+	<header class="site-header">
+		<nav class="nav" aria-label="Main">
+			<a class="brand" href="./">
+				<img src="assets/tether-google-cloud-logo.png" alt="Tether logo">
+				<span>Tether</span>
+			</a>
+			<div class="nav-links">
+				<a href="setup.html">Google Cloud setup</a>
+				<a href="privacy.html">Privacy</a>
+				<a href="terms.html">Terms</a>
+				<a class="button secondary" href="https://github.com/Llewellyn500/obsidian-tether">GitHub</a>
+			</div>
+		</nav>
+	</header>
+
+	<main>
+		<section class="hero">
+			<div class="hero-inner">
+				<div>
+					<p class="eyebrow">Obsidian plugin for self-managed sync</p>
+					<h1>Tether</h1>
+					<p class="lead">Tether keeps an Obsidian vault in sync with Google Drive using the user's own Google Cloud OAuth project and local Obsidian plugin settings.</p>
+					<div class="hero-actions">
+						<a class="button" href="setup.html">Use These OAuth URLs</a>
+						<a class="button secondary" href="privacy.html">Read Privacy Policy</a>
+					</div>
+				</div>
+				<div class="hero-art" aria-hidden="true">
+					<img src="assets/lap-logo-color.png" alt="">
+				</div>
+			</div>
+		</section>
+
+		<section class="section">
+			<div class="section-header">
+				<h2>What Tether Does</h2>
+				<p>Tether connects Obsidian to Google Drive so users can pull notes from Drive and push local vault changes back as Drive revisions. It does not run a hosted sync backend.</p>
+			</div>
+			<div class="grid">
+				<article class="card accent">
+					<h3>Local-first storage</h3>
+					<p>Tokens, folder choices, sync state, and plugin settings stay in the user's local Obsidian vault/plugin data.</p>
+				</article>
+				<article class="card teal">
+					<h3>Google Drive access</h3>
+					<p>The plugin requests Drive permissions so it can list folders, read synced files, upload revisions, and mirror deletions chosen by the user.</p>
+				</article>
+				<article class="card gold">
+					<h3>No analytics backend</h3>
+					<p>The current plugin code does not include ads, telemetry, or a third-party analytics service.</p>
+				</article>
+			</div>
+		</section>
+
+		<section class="section">
+			<div class="section-header">
+				<h2>Google Cloud Values</h2>
+				<p>Use these values when configuring OAuth branding, app domains, and redirect settings in Google Cloud.</p>
+			</div>
+			<div class="code-list">
+				<div class="code-row"><span>Homepage URL</span><code>https://llewellyn500.github.io/obsidian-tether/</code></div>
+				<div class="code-row"><span>Privacy Policy URL</span><code>https://llewellyn500.github.io/obsidian-tether/privacy.html</code></div>
+				<div class="code-row"><span>Terms of Service URL</span><code>https://llewellyn500.github.io/obsidian-tether/terms.html</code></div>
+				<div class="code-row"><span>Authorized Redirect URI</span><code>https://llewellyn500.github.io/obsidian-tether/oauth/callback.html</code></div>
+				<div class="code-row"><span>Authorized Domain</span><code>llewellyn500.github.io</code></div>
+				<div class="code-row"><span>Google Cloud Logo Upload</span><code>https://llewellyn500.github.io/obsidian-tether/assets/tether-google-cloud-logo.png</code></div>
+			</div>
+		</section>
+
+		<section class="section tight">
+			<div class="notice">
+				Tether is not affiliated with Google or Obsidian. Google may still show an unverified app warning until the OAuth project completes any required Google verification.
+			</div>
+		</section>
+	</main>
+
+	<footer class="site-footer">
+		<div class="footer-inner">
+			<span>Created by Llewellyn Paintsil.</span>
+			<span><a href="privacy.html">Privacy</a> | <a href="terms.html">Terms</a> | <a href="https://github.com/Llewellyn500/obsidian-tether/issues">Support</a></span>
+		</div>
+	</footer>
+</body>
+</html>

@@ -8,9 +8,6 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __markAsModule = (target) => __defProp(target, "__esModule", { value: true });
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
-};
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
@@ -28,77 +25,6 @@ var __toCommonJS = /* @__PURE__ */ ((cache) => {
     return cache && cache.get(module2) || (temp = __reExport(__markAsModule({}), module2, 1), cache && cache.set(module2, temp), temp);
   };
 })(typeof WeakMap !== "undefined" ? /* @__PURE__ */ new WeakMap() : 0);
-
-// auth/oauth.ts
-var oauth_exports = {};
-__export(oauth_exports, {
-  OAuthManager: () => OAuthManager
-});
-var import_obsidian2, SCOPES, REDIRECT_URI, OAuthManager;
-var init_oauth = __esm({
-  "auth/oauth.ts"() {
-    import_obsidian2 = require("obsidian");
-    SCOPES = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email";
-    REDIRECT_URI = "https://obsidian.md";
-    OAuthManager = class {
-      static async generateCodeVerifier() {
-        const array = new Uint8Array(32);
-        window.crypto.getRandomValues(array);
-        return btoa(String.fromCharCode(...array)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      }
-      static async generateCodeChallenge(verifier) {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(verifier);
-        const digest = await window.crypto.subtle.digest("SHA-256", data);
-        return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      }
-      static async getAuthUrl(clientId, codeChallenge, state) {
-        const params = new URLSearchParams({
-          client_id: clientId.trim(),
-          redirect_uri: REDIRECT_URI,
-          response_type: "code",
-          scope: SCOPES,
-          code_challenge: codeChallenge,
-          code_challenge_method: "S256",
-          access_type: "offline",
-          prompt: "consent",
-          state
-        });
-        return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-      }
-      static async exchangeCodeForToken(code, codeVerifier, clientId, clientSecret) {
-        const response = await (0, import_obsidian2.requestUrl)({
-          url: "https://oauth2.googleapis.com/token",
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: clientId,
-            client_secret: clientSecret,
-            code,
-            code_verifier: codeVerifier,
-            redirect_uri: REDIRECT_URI,
-            grant_type: "authorization_code"
-          }).toString()
-        });
-        return response.json;
-      }
-      static async refreshToken(refreshToken, clientId, clientSecret) {
-        const response = await (0, import_obsidian2.requestUrl)({
-          url: "https://oauth2.googleapis.com/token",
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            client_id: clientId,
-            client_secret: clientSecret,
-            refresh_token: refreshToken,
-            grant_type: "refresh_token"
-          }).toString()
-        });
-        return response.json;
-      }
-    };
-  }
-});
 
 // main.ts
 var main_exports = {};
@@ -170,6 +96,129 @@ var StateManager = class {
 
 // sync/gdrive.ts
 var import_obsidian3 = require("obsidian");
+
+// auth/oauth.ts
+var import_obsidian2 = require("obsidian");
+var SCOPES = "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email";
+var REDIRECT_URI = "https://llewellyn500.github.io/obsidian-tether/oauth/callback.html";
+var OAuthTokenError = class extends Error {
+  constructor(message, code, status) {
+    super(message);
+    this.name = "OAuthTokenError";
+    this.code = code;
+    this.status = status;
+  }
+};
+var OAuthManager = class {
+  static async generateCodeVerifier() {
+    const array = new Uint8Array(32);
+    window.crypto.getRandomValues(array);
+    return btoa(String.fromCharCode(...array)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  static async generateCodeChallenge(verifier) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(verifier);
+    const digest = await window.crypto.subtle.digest("SHA-256", data);
+    return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  static async getAuthUrl(clientId, codeChallenge, state) {
+    const params = new URLSearchParams({
+      client_id: clientId.trim(),
+      redirect_uri: REDIRECT_URI,
+      response_type: "code",
+      scope: SCOPES,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      access_type: "offline",
+      prompt: "consent",
+      state
+    });
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  }
+  static async exchangeCodeForToken(code, codeVerifier, clientId, clientSecret) {
+    return this.requestToken(new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      code_verifier: codeVerifier,
+      redirect_uri: REDIRECT_URI,
+      grant_type: "authorization_code"
+    }));
+  }
+  static async refreshToken(refreshToken, clientId, clientSecret) {
+    if (!refreshToken.trim()) {
+      throw new OAuthTokenError("No refresh token is saved. Please log in again.", "missing_refresh_token");
+    }
+    return this.requestToken(new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token"
+    }));
+  }
+  static isExpiredOrRevoked(error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? String(error.code || "").toLowerCase() : "";
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    return code === "invalid_grant" || code === "missing_refresh_token" || message.includes("invalid_grant") || message.includes("expired or revoked") || message.includes("token has been expired") || message.includes("token has been revoked") || message.includes("no refresh token");
+  }
+  static async requestToken(body) {
+    let response;
+    try {
+      response = await (0, import_obsidian2.requestUrl)({
+        url: "https://oauth2.googleapis.com/token",
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+    } catch (error) {
+      throw this.toTokenError(error);
+    }
+    const json = response.json || this.parseJson(response.text);
+    if (response.status >= 400 || (json == null ? void 0 : json.error)) {
+      throw this.toTokenError({
+        status: response.status,
+        json,
+        text: response.text
+      });
+    }
+    if (!(json == null ? void 0 : json.access_token)) {
+      throw new OAuthTokenError("Google did not return an access token.");
+    }
+    return json;
+  }
+  static toTokenError(error) {
+    if (error instanceof OAuthTokenError) {
+      return error;
+    }
+    const errorObj = typeof error === "object" && error !== null ? error : {};
+    const status = typeof errorObj.status === "number" ? errorObj.status : void 0;
+    const json = errorObj.json || this.parseJson(typeof errorObj.text === "string" ? errorObj.text : "");
+    const code = typeof (json == null ? void 0 : json.error) === "string" ? json.error : void 0;
+    const description = typeof (json == null ? void 0 : json.error_description) === "string" ? json.error_description : void 0;
+    const fallback = error instanceof Error ? error.message : String(error);
+    return new OAuthTokenError(description || code || fallback, code, status);
+  }
+  static parseJson(text) {
+    if (!text)
+      return null;
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return null;
+    }
+  }
+};
+
+// sync/gdrive.ts
+var SessionExpiredError = class extends Error {
+  constructor(message = "Session expired. Please log in again.") {
+    super(message);
+    this.name = "SessionExpiredError";
+  }
+};
+function isSessionExpiredError(error) {
+  return error instanceof SessionExpiredError || error instanceof Error && error.name === "SessionExpiredError";
+}
 var GoogleDriveClient = class {
   constructor(accessToken, onTokenRefresh, refreshParams) {
     this.accessToken = accessToken;
@@ -210,20 +259,42 @@ var GoogleDriveClient = class {
     return response;
   }
   async handleRefresh(options) {
+    await this.refreshAccessToken();
+    return this.request(options, false);
+  }
+  async refreshAccessToken() {
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+    this.refreshPromise = this.performTokenRefresh().finally(() => {
+      this.refreshPromise = void 0;
+    });
+    return this.refreshPromise;
+  }
+  async performTokenRefresh() {
     console.log("Access token expired. Attempting refresh...");
+    if (!this.refreshParams) {
+      throw new SessionExpiredError();
+    }
+    let tokens;
     try {
-      const { OAuthManager: OAuthManager2 } = await Promise.resolve().then(() => (init_oauth(), oauth_exports));
-      if (!this.refreshParams)
-        throw new Error("No refresh parameters");
-      const tokens = await OAuthManager2.refreshToken(this.refreshParams.refreshToken, this.refreshParams.clientId, this.refreshParams.clientSecret);
-      this.accessToken = tokens.access_token;
-      if (this.onTokenRefresh) {
-        await this.onTokenRefresh(tokens);
-      }
-      return this.request(options, false);
+      tokens = await OAuthManager.refreshToken(this.refreshParams.refreshToken, this.refreshParams.clientId, this.refreshParams.clientSecret);
     } catch (refreshError) {
       console.error("Token refresh failed", refreshError);
-      throw new Error("Session expired. Please log in again.");
+      if (OAuthManager.isExpiredOrRevoked(refreshError)) {
+        throw new SessionExpiredError();
+      }
+      throw refreshError;
+    }
+    this.applyTokenResponse(tokens);
+    if (this.onTokenRefresh) {
+      await this.onTokenRefresh(tokens);
+    }
+  }
+  applyTokenResponse(tokens) {
+    this.accessToken = tokens.access_token;
+    if (tokens.refresh_token && this.refreshParams) {
+      this.refreshParams.refreshToken = tokens.refresh_token;
     }
   }
   async listFiles(folderId) {
@@ -634,6 +705,8 @@ var SyncEngine = class {
       try {
         await this.processLocalPath(path, vaultRootDriveId);
       } catch (e) {
+        if (isSessionExpiredError(e))
+          throw e;
         console.error(`Failed to push ${path}`, e);
         if (this.isNotFound(e)) {
           this.stateManager.remove(path);
@@ -853,6 +926,8 @@ var SyncEngine = class {
       try {
         canonicalItems.push(await this.mergeDuplicateRemoteFiles(group, parentPath));
       } catch (e) {
+        if (isSessionExpiredError(e))
+          throw e;
         const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
         console.error(`Failed to merge Drive duplicates for ${displayName}`, e);
         this.stats.failed++;
@@ -937,6 +1012,8 @@ var SyncEngine = class {
           this.stats.currentFile = path;
           await this.processRemoteFile(path, item);
         } catch (e) {
+          if (isSessionExpiredError(e))
+            throw e;
           console.error(`Failed to pull ${path}`, e);
           if (this.isNotFound(e)) {
             this.stateManager.remove(path);
@@ -1056,6 +1133,8 @@ var SyncEngine = class {
           locallyDeletedPaths.add(path);
           await this.flushStateIfNeeded();
         } catch (e) {
+          if (isSessionExpiredError(e))
+            throw e;
           if (this.isNotFound(e)) {
             this.stateManager.remove(path);
             locallyDeletedPaths.add(path);
@@ -1336,6 +1415,12 @@ var CreateFolderModal = class extends import_obsidian6.Modal {
 // ui/setup-guide.ts
 var import_obsidian7 = require("obsidian");
 var SETUP_GUIDE_IMAGE_BASE_URL = "https://raw.githubusercontent.com/Llewellyn500/obsidian-tether/main/images";
+var TETHER_HOME_URL = "https://llewellyn500.github.io/obsidian-tether/";
+var TETHER_PRIVACY_URL = "https://llewellyn500.github.io/obsidian-tether/privacy.html";
+var TETHER_TERMS_URL = "https://llewellyn500.github.io/obsidian-tether/terms.html";
+var TETHER_REDIRECT_URI = "https://llewellyn500.github.io/obsidian-tether/oauth/callback.html";
+var TETHER_LOGO_URL = "https://llewellyn500.github.io/obsidian-tether/assets/tether-google-cloud-logo.png";
+var TETHER_AUTHORIZED_DOMAIN = "llewellyn500.github.io";
 function getSetupGuideImageUrl(imageName) {
   return `${SETUP_GUIDE_IMAGE_BASE_URL}/${imageName}.png`;
 }
@@ -1370,13 +1455,33 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
       { text: 'Click "OAuth consent screen"', image: "step-13" },
       { text: 'Click "Get started"', image: "step-14" },
       { text: 'Click the "App name" field.', image: "step-15" },
-      { text: 'Type "Tether-Sync"' },
+      { text: 'Type "Tether"' },
       { text: "Click User Support email.", image: "step-17" },
       { text: "Click your email address from the dropdown." },
       { text: 'Click "External"', image: "step-19" },
       { text: `Pick the developer's "Email address" (Developer contact info)`, image: "step-20" },
       { text: 'Click the "I agree to the Google API Services: User Data Policy." field.' },
       { text: 'Click "Create"', image: "step-22" },
+      {
+        text: "Open Branding and add this homepage URL:",
+        codeBlock: TETHER_HOME_URL
+      },
+      {
+        text: "Add this privacy policy URL:",
+        codeBlock: TETHER_PRIVACY_URL
+      },
+      {
+        text: "Add this terms of service URL:",
+        codeBlock: TETHER_TERMS_URL
+      },
+      {
+        text: "Add this authorized domain if Google asks for one:",
+        codeBlock: TETHER_AUTHORIZED_DOMAIN
+      },
+      {
+        text: "Download this logo and upload it as the Google Cloud app logo:",
+        codeBlock: TETHER_LOGO_URL
+      },
       { text: 'Click "Data Access"', image: "step-23" },
       { text: 'Click "Add or remove scopes"', image: "step-24" },
       {
@@ -1396,7 +1501,7 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
       { text: 'Type "Tether Sync" in the "Name" field.', image: "step-36" },
       {
         text: "Copy the redirect URI below:",
-        codeBlock: "https://obsidian.md"
+        codeBlock: TETHER_REDIRECT_URI
       },
       { text: 'Click the "Add URI" icon.', image: "step-38" },
       { text: 'Paste the redirect URI in the "URIs 1" field.', image: "step-39" },
@@ -1434,8 +1539,10 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
     const loginSteps = [
       'In Obsidian settings for Tether, click "Open Login Page".',
       "Log in with your Google account.",
-      "You will be redirected to obsidian.md. Copy the entire URL from your browser bar.",
-      'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.'
+      "You will be redirected to Tether's callback page. Copy the full URL shown there.",
+      'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.',
+      "After your first successful login, return to Audience in Google Cloud and publish the app to In production to avoid weekly re-logins.",
+      "After changing the publishing status, log in to Tether again so Google issues a fresh refresh token."
     ];
     const list = finalStep.createEl("ol");
     list.setAttr("style", "padding-left: 22px; line-height: 1.8;");
@@ -1455,10 +1562,12 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
 };
 
 // main.ts
-init_oauth();
 var BACKGROUND_SYNC_IDLE_DELAY_MS = 6e4;
+var ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1e3;
+var DEFAULT_ACCESS_TOKEN_TTL_MS = 55 * 60 * 1e3;
 var DEFAULT_SETTINGS = {
   accessToken: "",
+  accessTokenExpiresAt: 0,
   refreshToken: "",
   clientId: "",
   clientSecret: "",
@@ -1558,9 +1667,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   }
   initializeClient() {
     this.client = new GoogleDriveClient(this.settings.accessToken, async (tokens) => {
-      this.settings.accessToken = tokens.access_token;
-      if (tokens.refresh_token)
-        this.settings.refreshToken = tokens.refresh_token;
+      this.applyTokenResponse(tokens);
       await this.saveSettings();
     }, {
       refreshToken: this.settings.refreshToken,
@@ -1599,6 +1706,72 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.setupSyncEngine();
     }
   }
+  applyTokenResponse(tokens) {
+    this.settings.accessToken = tokens.access_token;
+    if (tokens.refresh_token) {
+      this.settings.refreshToken = tokens.refresh_token;
+    }
+    this.settings.accessTokenExpiresAt = this.getAccessTokenExpiresAt(tokens);
+  }
+  getAccessTokenExpiresAt(tokens) {
+    const expiresIn = Number(tokens.expires_in);
+    const ttlMs = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn * 1e3 : DEFAULT_ACCESS_TOKEN_TTL_MS;
+    return Date.now() + ttlMs;
+  }
+  shouldRefreshAccessToken() {
+    return !this.settings.accessTokenExpiresAt || this.settings.accessTokenExpiresAt - Date.now() <= ACCESS_TOKEN_REFRESH_BUFFER_MS;
+  }
+  async ensureValidSession(showNotice = true) {
+    if (!this.settings.accessToken) {
+      if (showNotice) {
+        new import_obsidian8.Notice("Please log in to Google Drive first in settings.");
+      }
+      return false;
+    }
+    if (!this.shouldRefreshAccessToken()) {
+      return true;
+    }
+    if (!this.settings.refreshToken) {
+      await this.handleExpiredSession(showNotice);
+      return false;
+    }
+    if (!this.client) {
+      this.initializeClient();
+    }
+    try {
+      await this.client.refreshAccessToken();
+      return true;
+    } catch (error) {
+      if (isSessionExpiredError(error)) {
+        await this.handleExpiredSession(true);
+      } else {
+        console.error("Session refresh failed", error);
+        if (showNotice) {
+          new import_obsidian8.Notice("Could not refresh Google session: " + (error instanceof Error ? error.message : String(error)));
+        }
+      }
+      return false;
+    }
+  }
+  async handleExpiredSession(showNotice = true) {
+    this.settings.accessToken = "";
+    this.settings.accessTokenExpiresAt = 0;
+    this.settings.refreshToken = "";
+    this.settings.codeVerifier = "";
+    this.settings.authState = "";
+    this.settings.userEmail = "";
+    await this.saveSettings();
+    if (this.syncEngine) {
+      this.syncEngine.updateStatus("Session expired", {
+        currentFile: "",
+        failed: 1,
+        errors: [{ path: "Google Drive", message: "Session expired. Please log in again in Tether settings." }]
+      }, true);
+    }
+    if (showNotice) {
+      new import_obsidian8.Notice("Google session expired. Please log in again in Tether settings.");
+    }
+  }
   async manualSync() {
     await this.runSync(this.settings.initialPullComplete ? "push" : "pull");
   }
@@ -1622,6 +1795,9 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       new import_obsidian8.Notice("Please select a Google Drive folder in settings.");
       return;
     }
+    if (!await this.ensureValidSession(!options.silent)) {
+      return;
+    }
     this.isSyncing = true;
     if ((_a = options.revealStatus) != null ? _a : true) {
       await this.activateView();
@@ -1638,7 +1814,9 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       }
     } catch (error) {
       console.error(`${mode} failed`, error);
-      if (!options.silent) {
+      if (isSessionExpiredError(error)) {
+        await this.handleExpiredSession(true);
+      } else if (!options.silent) {
         new import_obsidian8.Notice(`${mode === "pull" ? "Pull" : "Push"} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
@@ -1687,8 +1865,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       }
       code = decodeURIComponent(code);
       const tokens = await OAuthManager.exchangeCodeForToken(code, this.settings.codeVerifier, this.settings.clientId, this.settings.clientSecret);
-      this.settings.accessToken = tokens.access_token;
-      this.settings.refreshToken = tokens.refresh_token || this.settings.refreshToken;
+      this.applyTokenResponse(tokens);
       this.settings.codeVerifier = "";
       this.settings.authState = "";
       const client = new GoogleDriveClient(tokens.access_token);
@@ -1759,6 +1936,7 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
     if (isLoggedIn) {
       new import_obsidian8.Setting(step2).setName("Logged in \u2713").setDesc(`Account: ${this.plugin.settings.userEmail}`).addButton((btn) => btn.setButtonText("Log Out").onClick(async () => {
         this.plugin.settings.accessToken = "";
+        this.plugin.settings.accessTokenExpiresAt = 0;
         this.plugin.settings.refreshToken = "";
         this.plugin.settings.codeVerifier = "";
         this.plugin.settings.authState = "";
@@ -1785,7 +1963,11 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       btn.setButtonText(hasFolder ? "Change Folder" : "Select Folder");
       if (!hasFolder)
         btn.setCta();
-      btn.onClick(() => {
+      btn.onClick(async () => {
+        if (!await this.plugin.ensureValidSession(true)) {
+          this.display();
+          return;
+        }
         new FolderSuggestModal(this.app, this.plugin.client, async (folder) => {
           this.plugin.settings.folderId = folder.id;
           this.plugin.settings.folderName = folder.name;

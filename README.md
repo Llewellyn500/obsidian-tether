@@ -22,10 +22,11 @@ Tether is built for people who want a self-managed sync workflow across desktop 
 ## How it works
 
 1. Create your own Google Cloud OAuth app.
-2. Paste your client ID and client secret into Tether.
-3. Sign in with Google from inside Obsidian.
-4. Choose a Google Drive folder for Tether to use.
-5. Tether creates a vault-named folder inside that Drive folder and keeps both sides in sync.
+2. Use Tether's hosted setup pages for the OAuth homepage, privacy policy, terms, logo, and redirect URI.
+3. Paste your client ID and client secret into Tether.
+4. Sign in with Google from inside Obsidian.
+5. Choose a Google Drive folder for Tether to use.
+6. Tether creates a vault-named folder inside that Drive folder and keeps both sides in sync.
 
 ## Installation
 
@@ -51,10 +52,13 @@ Until the community listing is live, you can install Tether manually:
 
 1. Open the Tether settings tab in Obsidian.
 2. Select `Open Guide` if you want the in-app screenshot walkthrough.
-3. Add your Google Cloud `Client ID` and `Client Secret`.
-4. Select `Open Login Page`, sign in with Google, and paste the returned URL into `Authorization URL`.
-5. Choose the Google Drive folder you want Tether to use.
-6. Run `Pull from Google Drive` for the first sync, then use `Push to Google Drive` for local changes.
+3. Configure Google Cloud with the hosted Tether URLs listed in the guide.
+4. Add your Google Cloud `Client ID` and `Client Secret`.
+5. Select `Open Login Page`, sign in with Google, and paste the returned URL into `Authorization URL`.
+6. Choose the Google Drive folder you want Tether to use.
+7. Run `Pull from Google Drive` for the first sync, then use `Push to Google Drive` for local changes.
+
+> Important: if your Google Cloud OAuth app stays `External` + `Testing`, Google issues Drive refresh tokens that expire after 7 days. After confirming the setup works, move the OAuth app to `In production` in Google Cloud, then log in to Tether once more so Google issues a new refresh token. Tether can refresh normal access tokens automatically, but no local plugin can keep using a refresh token after Google expires or revokes it.
 
 ## iOS setup
 
@@ -91,7 +95,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Manifest setting: `isDesktopOnly: false`
 - Designed for desktop and mobile-compatible Obsidian environments.
 - Sync and auth network calls use Obsidian's `requestUrl` API and avoid Node/Electron-only APIs in the mobile path.
-- Sign-in opens Google in the system browser and accepts either the redirected URL or authorization code. A fully automatic OAuth return into Obsidian on every desktop and mobile platform would require an owned HTTPS redirect flow, native platform clients, or a small backend.
+- Sign-in opens Google in the system browser and redirects to Tether's GitHub Pages callback page. Copy the returned URL back into Obsidian to finish login.
 
 ## Privacy, security, and disclosures
 
@@ -107,7 +111,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 
 ### Disclosures
 
-- Plugin might make requests to 5 external domains: `accounts.google.com`, `oauth2.googleapis.com`, `obsidian.md`, `raw.githubusercontent.com`, and `www.googleapis.com`.
+- Plugin might make requests to 5 external domains: `accounts.google.com`, `oauth2.googleapis.com`, `llewellyn500.github.io`, `raw.githubusercontent.com`, and `www.googleapis.com`.
 - Clipboard access: reads or writes the system clipboard, which may expose content the user copied from outside Obsidian.
 - Found `atob()`/`btoa()` base64 calls (2 total), which may be used to obscure strings.
 - Vault read: reads individual vault files via the Obsidian API (`vault.read`, `vault.cachedRead`).
@@ -140,13 +144,33 @@ Tether includes an in-app setup guide with screenshots. If you prefer a GitHub-r
 
 1. Open `OAuth consent screen`.
 2. Select `Get started`.
-3. Use `Tether-Sync` as the app name.
+3. Use `Tether` as the app name.
 4. Choose your support email.
 5. Select `External`.
 6. Add your email under developer contact info.
 7. Accept the Google API Services: User Data Policy and create the app.
 
-### 4. Add the required scopes
+### 4. Add Tether branding and app domain links
+
+Use the hosted Tether support site for the values Google asks for during branding and OAuth setup:
+
+```text
+Homepage URL: https://llewellyn500.github.io/obsidian-tether/
+Privacy Policy URL: https://llewellyn500.github.io/obsidian-tether/privacy.html
+Terms of Service URL: https://llewellyn500.github.io/obsidian-tether/terms.html
+Authorized Domain: llewellyn500.github.io
+Logo URL: https://llewellyn500.github.io/obsidian-tether/assets/tether-google-cloud-logo.png
+```
+
+1. Open `Branding`.
+2. Add the app homepage, privacy policy, and terms of service URLs.
+3. Add `llewellyn500.github.io` under authorized domains if Google asks for an authorized domain.
+4. Download the logo from the logo URL above and upload it as the app logo.
+5. Save or publish the branding changes when Google allows it.
+
+If Google requires a verified custom domain before full verification, you can still use these pages for setup while testing, then point a custom domain at the same GitHub Pages site later.
+
+### 5. Add the required scopes
 
 1. Open `Data Access`.
 2. Select `Add or remove scopes`.
@@ -158,7 +182,7 @@ https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.meta
 
 4. Update and save.
 
-### 5. Create an OAuth client
+### 6. Create an OAuth client
 
 1. Open `Audience` and add your email as a test user.
 2. Open `Clients` and select `Create client`.
@@ -167,22 +191,23 @@ https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.meta
 5. Add this redirect URI:
 
 ```text
-https://obsidian.md
+https://llewellyn500.github.io/obsidian-tether/oauth/callback.html
 ```
 
 6. Create the client.
 7. Copy the generated client ID and client secret into Tether.
 
-### 6. Authenticate in Tether
+### 7. Authenticate in Tether
 
 1. Open Tether settings in Obsidian.
 2. Select `Open Login Page`.
 3. Sign in to Google.
-4. When you are redirected to `obsidian.md`, copy the full URL or just the `code=` value.
+4. When you are redirected to Tether's callback page, copy the full URL shown on the page.
 5. Paste it into `Authorization URL`.
 6. Select `Verify Login`.
+7. After your first successful login, return to `Audience` in Google Cloud and publish the OAuth app to `In production` to avoid weekly re-logins. If it remains `External` + `Testing`, Google expires Drive refresh tokens after 7 days. After changing the publishing status, log in to Tether again so Google issues a fresh refresh token.
 
-### 7. Choose a sync folder
+### 8. Choose a sync folder
 
 1. Select `Select Folder`.
 2. Pick an existing Google Drive folder or create a new one.

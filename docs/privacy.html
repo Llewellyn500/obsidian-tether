@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Tether Privacy Policy</title>
+	<meta name="description" content="Privacy policy for the Tether Obsidian plugin.">
+	<link rel="icon" href="assets/tether-google-cloud-logo.png">
+	<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+	<header class="site-header">
+		<nav class="nav" aria-label="Main">
+			<a class="brand" href="./"><img src="assets/tether-google-cloud-logo.png" alt="Tether logo"><span>Tether</span></a>
+			<div class="nav-links">
+				<a href="setup.html">Google Cloud setup</a>
+				<a href="privacy.html">Privacy</a>
+				<a href="terms.html">Terms</a>
+				<a class="button secondary" href="https://github.com/Llewellyn500/obsidian-tether">GitHub</a>
+			</div>
+		</nav>
+	</header>
+
+	<main class="section">
+		<article class="policy">
+			<p class="eyebrow">Last updated: May 21, 2026</p>
+			<h1>Tether Privacy Policy</h1>
+			<p>Tether is an Obsidian plugin that syncs a user's local Obsidian vault with a Google Drive folder selected by that user. This policy describes the current public plugin behavior.</p>
+
+			<h2>Information Tether Accesses</h2>
+			<p>Tether may access the following information after a user authorizes it with Google:</p>
+			<ul>
+				<li>Google account email address, used to show which account is connected.</li>
+				<li>Google Drive folder metadata, used to let the user choose a sync folder and locate synced content.</li>
+				<li>Google Drive files and folders inside the selected sync location, used to upload, download, update, or delete synced vault files.</li>
+				<li>Local Obsidian vault files, plugin settings, and sync state, used to compare local and remote changes.</li>
+			</ul>
+
+			<h2>How Tether Uses Google User Data</h2>
+			<p>Tether uses Google user data only to provide user-requested Google Drive sync features. The plugin lists folders, reads selected Drive files, writes vault files to Drive, updates Drive revisions, and mirrors deletions when the user runs sync actions or enables automatic sync.</p>
+
+			<h2>Storage</h2>
+			<p>Tether stores access tokens, refresh tokens, selected folder details, the connected email address, plugin settings, and sync state locally in Obsidian plugin data or in the user's vault configuration folder. Tether does not operate a hosted backend service for this sync flow.</p>
+
+			<h2>Sharing</h2>
+			<p>Tether does not sell Google user data. The plugin sends data to Google APIs only as needed to authenticate and sync with Google Drive. The current plugin code does not include advertising, telemetry, or third-party analytics.</p>
+
+			<h2>Limited Use</h2>
+			<p>Tether's use and transfer of information received from Google APIs will adhere to the Google API Services User Data Policy, including the Limited Use requirements.</p>
+
+			<h2>User Control</h2>
+			<p>Users can disconnect Tether by logging out in the plugin settings, revoking access from their Google Account permissions page, deleting local plugin data, or uninstalling the plugin from Obsidian.</p>
+
+			<h2>Security</h2>
+			<p>Tether relies on OAuth tokens stored locally by Obsidian plugin data. Users should protect their devices, vault folders, and cloud backups because anyone with access to those local files may be able to access plugin configuration data.</p>
+
+			<h2>Contact</h2>
+			<p>For privacy questions or support, open an issue at <a href="https://github.com/Llewellyn500/obsidian-tether/issues">github.com/Llewellyn500/obsidian-tether/issues</a>.</p>
+		</article>
+	</main>
+
+	<footer class="site-footer">
+		<div class="footer-inner">
+			<span>Created by Llewellyn Paintsil.</span>
+			<span><a href="./">Home</a> | <a href="terms.html">Terms</a></span>
+		</div>
+	</footer>
+</body>
+</html>

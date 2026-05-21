@@ -7,6 +7,12 @@ interface SetupStep {
 }
 
 const SETUP_GUIDE_IMAGE_BASE_URL = 'https://raw.githubusercontent.com/Llewellyn500/obsidian-tether/main/images';
+const TETHER_HOME_URL = 'https://llewellyn500.github.io/obsidian-tether/';
+const TETHER_PRIVACY_URL = 'https://llewellyn500.github.io/obsidian-tether/privacy.html';
+const TETHER_TERMS_URL = 'https://llewellyn500.github.io/obsidian-tether/terms.html';
+const TETHER_REDIRECT_URI = 'https://llewellyn500.github.io/obsidian-tether/oauth/callback.html';
+const TETHER_LOGO_URL = 'https://llewellyn500.github.io/obsidian-tether/assets/tether-google-cloud-logo.png';
+const TETHER_AUTHORIZED_DOMAIN = 'llewellyn500.github.io';
 
 function getSetupGuideImageUrl(imageName: string): string {
 	return `${SETUP_GUIDE_IMAGE_BASE_URL}/${imageName}.png`;
@@ -50,13 +56,33 @@ export class SetupGuideModal extends Modal {
 			{ text: 'Click "OAuth consent screen"', image: 'step-13' },
 			{ text: 'Click "Get started"', image: 'step-14' },
 			{ text: 'Click the "App name" field.', image: 'step-15' },
-			{ text: 'Type "Tether-Sync"' },
+			{ text: 'Type "Tether"' },
 			{ text: 'Click User Support email.', image: 'step-17' },
 			{ text: 'Click your email address from the dropdown.' },
 			{ text: 'Click "External"', image: 'step-19' },
 			{ text: 'Pick the developer\'s "Email address" (Developer contact info)', image: 'step-20' },
 			{ text: 'Click the "I agree to the Google API Services: User Data Policy." field.' },
 			{ text: 'Click "Create"', image: 'step-22' },
+			{
+				text: 'Open Branding and add this homepage URL:',
+				codeBlock: TETHER_HOME_URL
+			},
+			{
+				text: 'Add this privacy policy URL:',
+				codeBlock: TETHER_PRIVACY_URL
+			},
+			{
+				text: 'Add this terms of service URL:',
+				codeBlock: TETHER_TERMS_URL
+			},
+			{
+				text: 'Add this authorized domain if Google asks for one:',
+				codeBlock: TETHER_AUTHORIZED_DOMAIN
+			},
+			{
+				text: 'Download this logo and upload it as the Google Cloud app logo:',
+				codeBlock: TETHER_LOGO_URL
+			},
 			{ text: 'Click "Data Access"', image: 'step-23' },
 			{ text: 'Click "Add or remove scopes"', image: 'step-24' },
 			{
@@ -76,7 +102,7 @@ export class SetupGuideModal extends Modal {
 			{ text: 'Type "Tether Sync" in the "Name" field.', image: 'step-36' },
 			{
 				text: 'Copy the redirect URI below:',
-				codeBlock: 'https://obsidian.md'
+				codeBlock: TETHER_REDIRECT_URI
 			},
 			{ text: 'Click the "Add URI" icon.', image: 'step-38' },
 			{ text: 'Paste the redirect URI in the "URIs 1" field.', image: 'step-39' },
@@ -144,8 +170,10 @@ export class SetupGuideModal extends Modal {
 		const loginSteps = [
 			'In Obsidian settings for Tether, click "Open Login Page".',
 			'Log in with your Google account.',
-			'You will be redirected to obsidian.md. Copy the entire URL from your browser bar.',
-			'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.'
+			'You will be redirected to Tether\'s callback page. Copy the full URL shown there.',
+			'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.',
+			'After your first successful login, return to Audience in Google Cloud and publish the app to In production to avoid weekly re-logins.',
+			'After changing the publishing status, log in to Tether again so Google issues a fresh refresh token.'
 		];
 		const list = finalStep.createEl('ol');
 		list.setAttr('style', 'padding-left: 22px; line-height: 1.8;');

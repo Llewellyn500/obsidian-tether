@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Tether OAuth Callback</title>
+	<meta name="description" content="Copy the Google OAuth response URL back into Tether.">
+	<link rel="icon" href="../assets/tether-google-cloud-logo.png">
+	<link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+	<header class="site-header">
+		<nav class="nav" aria-label="Main">
+			<a class="brand" href="../"><img src="../assets/tether-google-cloud-logo.png" alt="Tether logo"><span>Tether</span></a>
+			<div class="nav-links">
+				<a href="../setup.html">Google Cloud setup</a>
+				<a href="../privacy.html">Privacy</a>
+				<a href="../terms.html">Terms</a>
+			</div>
+		</nav>
+	</header>
+
+	<main class="section">
+		<section class="callback-panel">
+			<p class="eyebrow">Authentication callback</p>
+			<h1>Copy This URL Into Tether</h1>
+			<p>Google has redirected you back to Tether's OAuth helper page. Copy the full URL below, return to Obsidian, paste it into the Tether Authorization URL field, and select Verify Login.</p>
+			<textarea id="callback-url" class="copy-box" readonly></textarea>
+			<div class="inline-actions" style="margin-top: 14px;">
+				<button id="copy-button" class="button" type="button">Copy URL</button>
+				<a class="button secondary" href="../setup.html">Setup Values</a>
+			</div>
+			<p id="status" aria-live="polite"></p>
+		</section>
+	</main>
+
+	<script>
+		(function () {
+			var field = document.getElementById('callback-url');
+			var button = document.getElementById('copy-button');
+			var status = document.getElementById('status');
+			field.value = window.location.href;
+
+			if (!window.location.search && !window.location.hash) {
+				status.textContent = 'No authorization code was found in this URL. Start the login from Tether settings and return here after Google redirects you.';
+			}
+
+			button.addEventListener('click', function () {
+				field.select();
+				field.setSelectionRange(0, field.value.length);
+
+				if (navigator.clipboard && navigator.clipboard.writeText) {
+					navigator.clipboard.writeText(field.value).then(function () {
+						status.textContent = 'Copied. Return to Obsidian and paste it into Tether.';
+					}).catch(function () {
+						document.execCommand('copy');
+						status.textContent = 'Copied. Return to Obsidian and paste it into Tether.';
+					});
+					return;
+				}
+
+				document.execCommand('copy');
+				status.textContent = 'Copied. Return to Obsidian and paste it into Tether.';
+			});
+		}());
+	</script>
+</body>
+</html>

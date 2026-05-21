@@ -1,6 +1,6 @@
 import { App, Notice } from 'obsidian';
 import type { Stat } from 'obsidian';
-import { GoogleDriveClient, DriveFile } from './gdrive';
+import { GoogleDriveClient, DriveFile, isSessionExpiredError } from './gdrive';
 import { StateManager } from './state';
 import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-view';
 
@@ -166,6 +166,7 @@ export class SyncEngine {
 			try {
 				await this.processLocalPath(path, vaultRootDriveId);
 			} catch (e) {
+				if (isSessionExpiredError(e)) throw e;
 				console.error(`Failed to push ${path}`, e);
 				if (this.isNotFound(e)) {
 					this.stateManager.remove(path);
@@ -428,6 +429,7 @@ export class SyncEngine {
 			try {
 				canonicalItems.push(await this.mergeDuplicateRemoteFiles(group, parentPath));
 			} catch (e) {
+				if (isSessionExpiredError(e)) throw e;
 				const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
 				console.error(`Failed to merge Drive duplicates for ${displayName}`, e);
 				this.stats.failed++;
@@ -528,6 +530,7 @@ export class SyncEngine {
 					this.stats.currentFile = path;
 					await this.processRemoteFile(path, item);
 				} catch (e) {
+					if (isSessionExpiredError(e)) throw e;
 					console.error(`Failed to pull ${path}`, e);
 					if (this.isNotFound(e)) {
 						this.stateManager.remove(path);
@@ -663,6 +666,7 @@ export class SyncEngine {
 					locallyDeletedPaths.add(path);
 					await this.flushStateIfNeeded();
 				} catch (e) {
+					if (isSessionExpiredError(e)) throw e;
 					if (this.isNotFound(e)) {
 						this.stateManager.remove(path);
 						locallyDeletedPaths.add(path);

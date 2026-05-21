@@ -1,16 +1,19 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice, addIcon, WorkspaceLeaf } from 'obsidian';
 import { StateManager } from './sync/state';
-import { GoogleDriveClient } from './sync/gdrive';
+import { GoogleDriveClient, isSessionExpiredError } from './sync/gdrive';
 import { SyncEngine, SyncMode } from './sync/engine';
 import { FolderSuggestModal } from './ui/folder-modal';
 import { SetupGuideModal } from './ui/setup-guide';
-import { OAuthManager } from './auth/oauth';
+import { OAuthManager, OAuthTokenResponse } from './auth/oauth';
 import { SyncStatusView, VIEW_TYPE_SYNC_STATUS } from './ui/sync-view';
 
 const BACKGROUND_SYNC_IDLE_DELAY_MS = 60000;
+const ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const DEFAULT_ACCESS_TOKEN_TTL_MS = 55 * 60 * 1000;
 
 interface GoogleDriveSyncSettings {
 	accessToken: string;
+	accessTokenExpiresAt: number;
 	refreshToken: string;
 	clientId: string;
 	clientSecret: string;
@@ -26,6 +29,7 @@ interface GoogleDriveSyncSettings {
 
 const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 	accessToken: '',
+	accessTokenExpiresAt: 0,
 	refreshToken: '',
 	clientId: '',
 	clientSecret: '',
@@ -158,9 +162,8 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	initializeClient() {
 		this.client = new GoogleDriveClient(
 			this.settings.accessToken,
-			async (tokens) => {
-				this.settings.accessToken = tokens.access_token;
-				if (tokens.refresh_token) this.settings.refreshToken = tokens.refresh_token;
+			async (tokens: OAuthTokenResponse) => {
+				this.applyTokenResponse(tokens);
 				await this.saveSettings();
 			},
 			{
@@ -203,6 +206,86 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		}
 	}
 
+	private applyTokenResponse(tokens: OAuthTokenResponse) {
+		this.settings.accessToken = tokens.access_token;
+		if (tokens.refresh_token) {
+			this.settings.refreshToken = tokens.refresh_token;
+		}
+		this.settings.accessTokenExpiresAt = this.getAccessTokenExpiresAt(tokens);
+	}
+
+	private getAccessTokenExpiresAt(tokens: OAuthTokenResponse): number {
+		const expiresIn = Number(tokens.expires_in);
+		const ttlMs = Number.isFinite(expiresIn) && expiresIn > 0
+			? expiresIn * 1000
+			: DEFAULT_ACCESS_TOKEN_TTL_MS;
+		return Date.now() + ttlMs;
+	}
+
+	private shouldRefreshAccessToken(): boolean {
+		return !this.settings.accessTokenExpiresAt ||
+			this.settings.accessTokenExpiresAt - Date.now() <= ACCESS_TOKEN_REFRESH_BUFFER_MS;
+	}
+
+	async ensureValidSession(showNotice = true): Promise<boolean> {
+		if (!this.settings.accessToken) {
+			if (showNotice) {
+				new Notice('Please log in to Google Drive first in settings.');
+			}
+			return false;
+		}
+
+		if (!this.shouldRefreshAccessToken()) {
+			return true;
+		}
+
+		if (!this.settings.refreshToken) {
+			await this.handleExpiredSession(showNotice);
+			return false;
+		}
+
+		if (!this.client) {
+			this.initializeClient();
+		}
+
+		try {
+			await this.client.refreshAccessToken();
+			return true;
+		} catch (error) {
+			if (isSessionExpiredError(error)) {
+				await this.handleExpiredSession(true);
+			} else {
+				console.error('Session refresh failed', error);
+				if (showNotice) {
+					new Notice('Could not refresh Google session: ' + (error instanceof Error ? error.message : String(error)));
+				}
+			}
+			return false;
+		}
+	}
+
+	private async handleExpiredSession(showNotice = true) {
+		this.settings.accessToken = '';
+		this.settings.accessTokenExpiresAt = 0;
+		this.settings.refreshToken = '';
+		this.settings.codeVerifier = '';
+		this.settings.authState = '';
+		this.settings.userEmail = '';
+		await this.saveSettings();
+
+		if (this.syncEngine) {
+			this.syncEngine.updateStatus('Session expired', {
+				currentFile: '',
+				failed: 1,
+				errors: [{ path: 'Google Drive', message: 'Session expired. Please log in again in Tether settings.' }]
+			}, true);
+		}
+
+		if (showNotice) {
+			new Notice('Google session expired. Please log in again in Tether settings.');
+		}
+	}
+
 	async manualSync() {
 		await this.runSync(this.settings.initialPullComplete ? 'push' : 'pull');
 	}
@@ -228,6 +311,9 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			new Notice('Please select a Google Drive folder in settings.');
 			return;
 		}
+		if (!(await this.ensureValidSession(!options.silent))) {
+			return;
+		}
 		
 		this.isSyncing = true;
 		if (options.revealStatus ?? true) {
@@ -246,7 +332,9 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			}
 		} catch (error) {
 			console.error(`${mode} failed`, error);
-			if (!options.silent) {
+			if (isSessionExpiredError(error)) {
+				await this.handleExpiredSession(true);
+			} else if (!options.silent) {
 				new Notice(`${mode === 'pull' ? 'Pull' : 'Push'} failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		} finally {
@@ -307,8 +395,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 				this.settings.clientSecret
 			);
 			
-			this.settings.accessToken = tokens.access_token;
-			this.settings.refreshToken = tokens.refresh_token || this.settings.refreshToken;
+			this.applyTokenResponse(tokens);
 			this.settings.codeVerifier = '';
 			this.settings.authState = '';
 			
@@ -433,6 +520,7 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 					.setButtonText('Log Out')
 					.onClick(async () => {
 						this.plugin.settings.accessToken = '';
+						this.plugin.settings.accessTokenExpiresAt = 0;
 						this.plugin.settings.refreshToken = '';
 						this.plugin.settings.codeVerifier = '';
 						this.plugin.settings.authState = '';
@@ -480,7 +568,11 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 			.addButton(btn => {
 				btn.setButtonText(hasFolder ? 'Change Folder' : 'Select Folder');
 				if (!hasFolder) btn.setCta();
-				btn.onClick(() => {
+				btn.onClick(async () => {
+					if (!(await this.plugin.ensureValidSession(true))) {
+						this.display();
+						return;
+					}
 					new FolderSuggestModal(this.app, this.plugin.client, async (folder) => {
 						this.plugin.settings.folderId = folder.id;
 						this.plugin.settings.folderName = folder.name;

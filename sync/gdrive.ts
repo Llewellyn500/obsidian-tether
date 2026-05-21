@@ -1,4 +1,5 @@
 import { requestUrl, RequestUrlParam } from 'obsidian';
+import { OAuthManager, OAuthTokenResponse } from '../auth/oauth';
 
 export interface DriveFile {
 	id: string;
@@ -14,10 +15,23 @@ export interface DriveFilePage {
 	nextPageToken?: string;
 }
 
+export class SessionExpiredError extends Error {
+	constructor(message = 'Session expired. Please log in again.') {
+		super(message);
+		this.name = 'SessionExpiredError';
+	}
+}
+
+export function isSessionExpiredError(error: unknown): boolean {
+	return error instanceof SessionExpiredError ||
+		(error instanceof Error && error.name === 'SessionExpiredError');
+}
+
 export class GoogleDriveClient {
 	accessToken: string;
 	onTokenRefresh?: (tokens: any) => Promise<void>;
 	refreshParams?: { refreshToken: string, clientId: string, clientSecret: string };
+	private refreshPromise?: Promise<void>;
 
 	constructor(accessToken: string, onTokenRefresh?: (tokens: any) => Promise<void>, refreshParams?: { refreshToken: string, clientId: string, clientSecret: string }) {
 		this.accessToken = accessToken;
@@ -66,24 +80,54 @@ export class GoogleDriveClient {
 	}
 
 	private async handleRefresh(options: RequestUrlParam): Promise<any> {
-		console.log('Access token expired. Attempting refresh...');
-		try {
-			const { OAuthManager } = await import('../auth/oauth');
-			if (!this.refreshParams) throw new Error('No refresh parameters');
+		await this.refreshAccessToken();
+		return this.request(options, false);
+	}
 
-			const tokens = await OAuthManager.refreshToken(
+	async refreshAccessToken(): Promise<void> {
+		if (this.refreshPromise) {
+			return this.refreshPromise;
+		}
+
+		this.refreshPromise = this.performTokenRefresh()
+			.finally(() => {
+				this.refreshPromise = undefined;
+			});
+
+		return this.refreshPromise;
+	}
+
+	private async performTokenRefresh(): Promise<void> {
+		console.log('Access token expired. Attempting refresh...');
+		if (!this.refreshParams) {
+			throw new SessionExpiredError();
+		}
+
+		let tokens: OAuthTokenResponse;
+		try {
+			tokens = await OAuthManager.refreshToken(
 				this.refreshParams.refreshToken,
 				this.refreshParams.clientId,
 				this.refreshParams.clientSecret
 			);
-			this.accessToken = tokens.access_token;
-			if (this.onTokenRefresh) {
-				await this.onTokenRefresh(tokens);
-			}
-			return this.request(options, false);
 		} catch (refreshError) {
 			console.error('Token refresh failed', refreshError);
-			throw new Error('Session expired. Please log in again.');
+			if (OAuthManager.isExpiredOrRevoked(refreshError)) {
+				throw new SessionExpiredError();
+			}
+			throw refreshError;
+		}
+
+		this.applyTokenResponse(tokens);
+		if (this.onTokenRefresh) {
+			await this.onTokenRefresh(tokens);
+		}
+	}
+
+	private applyTokenResponse(tokens: OAuthTokenResponse) {
+		this.accessToken = tokens.access_token;
+		if (tokens.refresh_token && this.refreshParams) {
+			this.refreshParams.refreshToken = tokens.refresh_token;
 		}
 	}
 

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Tether Google Cloud Setup</title>
+	<meta name="description" content="Google Cloud OAuth values for configuring Tether.">
+	<link rel="icon" href="assets/tether-google-cloud-logo.png">
+	<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+	<header class="site-header">
+		<nav class="nav" aria-label="Main">
+			<a class="brand" href="./"><img src="assets/tether-google-cloud-logo.png" alt="Tether logo"><span>Tether</span></a>
+			<div class="nav-links">
+				<a href="setup.html">Google Cloud setup</a>
+				<a href="privacy.html">Privacy</a>
+				<a href="terms.html">Terms</a>
+				<a class="button secondary" href="https://github.com/Llewellyn500/obsidian-tether">GitHub</a>
+			</div>
+		</nav>
+	</header>
+
+	<main>
+		<section class="section">
+			<div class="section-header">
+				<p class="eyebrow">Google Auth Platform</p>
+				<h1>Google Cloud Setup Values</h1>
+				<p class="lead">Use these exact values when configuring Tether's OAuth consent screen, app domain links, and OAuth client redirect URI.</p>
+			</div>
+
+			<div class="code-list">
+				<div class="code-row"><span>Application name</span><code>Tether</code></div>
+				<div class="code-row"><span>Application home page</span><code>https://llewellyn500.github.io/obsidian-tether/</code></div>
+				<div class="code-row"><span>Privacy policy</span><code>https://llewellyn500.github.io/obsidian-tether/privacy.html</code></div>
+				<div class="code-row"><span>Terms of service</span><code>https://llewellyn500.github.io/obsidian-tether/terms.html</code></div>
+				<div class="code-row"><span>Authorized domain</span><code>llewellyn500.github.io</code></div>
+				<div class="code-row"><span>Authorized redirect URI</span><code>https://llewellyn500.github.io/obsidian-tether/oauth/callback.html</code></div>
+				<div class="code-row"><span>Logo file</span><code>https://llewellyn500.github.io/obsidian-tether/assets/tether-google-cloud-logo.png</code></div>
+				<div class="code-row"><span>Scopes</span><code>https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.metadata.readonly openid email</code></div>
+			</div>
+		</section>
+
+		<section class="section tight">
+			<div class="grid">
+				<article class="card accent">
+					<h3>1. Add branding</h3>
+					<p>In Google Auth Platform, open Branding. Set the app name, support email, logo, homepage, privacy policy, and terms links.</p>
+				</article>
+				<article class="card teal">
+					<h3>2. Add data access</h3>
+					<p>Open Data Access and add the Drive, Drive metadata, openid, and email scopes listed above.</p>
+				</article>
+				<article class="card gold">
+					<h3>3. Publish after testing</h3>
+					<p>Keep Testing while setup is incomplete. After one successful login, publish to In production, then log in to Tether again for a fresh refresh token.</p>
+				</article>
+			</div>
+		</section>
+
+		<section class="section tight">
+			<div class="notice">
+				If Google requires additional verification, complete the requested Google verification steps. Publishing to production avoids the normal 7-day Testing refresh-token expiry, but unverified apps may still show Google's warning screen or user cap.
+			</div>
+		</section>
+	</main>
+
+	<footer class="site-footer">
+		<div class="footer-inner">
+			<span>Created by Llewellyn Paintsil.</span>
+			<span><a href="./">Home</a> | <a href="privacy.html">Privacy</a> | <a href="terms.html">Terms</a></span>
+		</div>
+	</footer>
+</body>
+</html>
