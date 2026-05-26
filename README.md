@@ -87,6 +87,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Interval sync pushes local changes to Google Drive.
 - Pull replaces local files with the Google Drive version, while deferring open or recently edited local files.
 - Pull mirrors remote deletions locally; push mirrors local deletions to Google Drive.
+- Pull now refuses to delete the local vault when the Drive vault root looks empty or completely mismatched. Push also refuses to delete every tracked remote item when the local vault looks empty or completely mismatched.
 - If a startup/manual pull or manual push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
 - Tether checks each Drive folder for duplicate same-name files, folds differing duplicate content into the chosen file's Drive revision history, then removes the extra Drive files.

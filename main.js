@@ -630,7 +630,6 @@ var MANUAL_STATUS_UPDATE_MS = 500;
 var BACKGROUND_STATUS_UPDATE_MS = 3e3;
 var WORK_YIELD_ITEM_LIMIT = 25;
 var CATASTROPHIC_DELETE_RATIO = 0.8;
-var CATASTROPHIC_DELETE_MIN_TRACKED = 10;
 var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
@@ -699,7 +698,7 @@ var SyncEngine = class {
       await this.stateManager.load();
       const vaultName = this.app.vault.getName();
       this.updateStatus(`Locating vault root...`);
-      const vaultRootDriveId = await this.ensureVaultRoot(vaultName);
+      const vaultRootDriveId = await this.ensureVaultRoot(vaultName, mode === "push");
       this.folderCache.set("", vaultRootDriveId);
       if (mode === "pull") {
         await this.pullFromRemote(vaultRootDriveId);
@@ -1090,7 +1089,7 @@ Continue only if this matches what you expect.`;
       throw error;
     }
   }
-  async ensureVaultRoot(name) {
+  async ensureVaultRoot(name, createIfMissing = true) {
     const stateKey = `__VAULT_ROOT__`;
     const state = this.stateManager.get(stateKey);
     if (state)
@@ -1102,6 +1101,9 @@ Continue only if this matches what you expect.`;
       this.stateManager.set(stateKey, entry2);
       await this.flushStateIfNeeded(true);
       return existing.id;
+    }
+    if (!createIfMissing) {
+      throw new Error(`Drive vault folder "${name}" was not found inside the selected sync folder. Pull stopped before changing local files. Check the selected Google Drive folder and account, then try again.`);
     }
     const newFolder = await this.client.createFolder(name, this.folderId);
     const entry = { driveId: newFolder.id, lastSyncedMtime: 0, remoteMtime: newFolder.modifiedTime, etag: "" };
@@ -1188,9 +1190,20 @@ Continue only if this matches what you expect.`;
         deletionCandidates.push([path, entry]);
       }
     }
-    if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+    if (deletionCandidates.length === 0) {
+      return locallyDeletedPaths;
+    }
+    if (localPathSet.size === 0 || deletionCandidates.length === trackedCount) {
+      const msg = localPathSet.size === 0 ? `Push paused remote deletions: this device returned no local files or folders, but Drive has ${trackedCount} tracked item${trackedCount === 1 ? "" : "s"}. No remote files were deleted.` : `Push paused remote deletions: every tracked remote item is missing locally (${trackedCount}/${trackedCount}). No remote files were deleted. Check this vault before pushing again.`;
+      console.error(msg);
+      new import_obsidian5.Notice(msg);
+      this.stats.failed++;
+      this.stats.errors.push({ path: "Remote deletions", message: msg });
+      return locallyDeletedPaths;
+    }
+    if (trackedCount > 0 && deletionCandidates.length / trackedCount >= CATASTROPHIC_DELETE_RATIO) {
       if (!this.shouldProceedWithLargeDeletion("push", deletionCandidates.length, trackedCount)) {
-        const msg = `Push paused remote deletions: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
+        const msg = `Push paused remote deletions: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>=${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
         console.error(msg);
         new import_obsidian5.Notice(msg);
         this.stats.failed++;
@@ -1228,9 +1241,19 @@ Continue only if this matches what you expect.`;
     const sortedEntries = stateEntries.filter(([path]) => path !== "__VAULT_ROOT__" && !this.isExcluded(path)).sort((a, b) => b[0].length - a[0].length);
     const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
     const trackedCount = sortedEntries.length;
-    if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
+    if (deletionCandidates.length === 0)
+      return;
+    if (remotePathSet.size === 0 || deletionCandidates.length === trackedCount) {
+      const msg = remotePathSet.size === 0 ? `Pull paused local deletions: the Drive vault root returned no files or folders, but this device has ${trackedCount} tracked local item${trackedCount === 1 ? "" : "s"}. No local files were deleted. Check the selected Google Drive folder/account before pulling again.` : `Pull paused local deletions: every tracked local item is missing from Drive (${trackedCount}/${trackedCount}). No local files were deleted. Check the selected Google Drive folder/account before pulling again.`;
+      console.error(msg);
+      new import_obsidian5.Notice(msg);
+      this.stats.failed++;
+      this.stats.errors.push({ path: "Local deletions", message: msg });
+      return;
+    }
+    if (trackedCount > 0 && deletionCandidates.length / trackedCount >= CATASTROPHIC_DELETE_RATIO) {
       if (!this.shouldProceedWithLargeDeletion("pull", deletionCandidates.length, trackedCount)) {
-        const msg = `Pull paused local deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No local files were deleted.`;
+        const msg = `Pull paused local deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>=${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No local files were deleted.`;
         console.error(msg);
         new import_obsidian5.Notice(msg);
         this.stats.failed++;
