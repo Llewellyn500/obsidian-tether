@@ -731,6 +731,14 @@ var SyncEngine = class {
     this.updateStatus("Pulling changes...");
     const remotePathSet = /* @__PURE__ */ new Set();
     await this.processRemoteTree(vaultRootDriveId, remotePathSet);
+    if (remotePathSet.size === 0) {
+      const msg = "Pull found an empty Drive vault root. No local files were changed. Check the selected Google Drive folder/account, or use Push if this is a new empty Drive setup.";
+      console.error(msg);
+      new import_obsidian5.Notice(msg);
+      this.stats.failed++;
+      this.stats.errors.push({ path: "Google Drive vault root", message: msg });
+      return;
+    }
     await this.handleRemoteDeletions(remotePathSet);
   }
   async pushToRemote(vaultRootDriveId) {
@@ -1092,24 +1100,70 @@ Continue only if this matches what you expect.`;
   async ensureVaultRoot(name, createIfMissing = true) {
     const stateKey = `__VAULT_ROOT__`;
     const state = this.stateManager.get(stateKey);
+    const folders = await this.client.listFolders(this.folderId);
+    const candidates = folders.filter((f) => f.name.toLowerCase() === name.toLowerCase());
+    if (!createIfMissing) {
+      const selected = await this.selectPullVaultRoot(name, candidates, state == null ? void 0 : state.driveId);
+      if (!selected) {
+        throw new Error(`Drive vault folder "${name}" was not found with files inside the selected sync folder. Pull stopped before changing local files. Check the selected Google Drive folder and account, then try again. If this is a new empty Drive setup, use Push first.`);
+      }
+      await this.saveVaultRootState(selected);
+      return selected.id;
+    }
     if (state)
       return state.driveId;
-    const folders = await this.client.listFolders(this.folderId);
-    const existing = folders.find((f) => f.name.toLowerCase() === name.toLowerCase());
+    const existing = candidates[0];
     if (existing) {
-      const entry2 = { driveId: existing.id, lastSyncedMtime: 0, remoteMtime: existing.modifiedTime, etag: "" };
-      this.stateManager.set(stateKey, entry2);
-      await this.flushStateIfNeeded(true);
+      await this.saveVaultRootState(existing);
       return existing.id;
     }
-    if (!createIfMissing) {
-      throw new Error(`Drive vault folder "${name}" was not found inside the selected sync folder. Pull stopped before changing local files. Check the selected Google Drive folder and account, then try again.`);
-    }
     const newFolder = await this.client.createFolder(name, this.folderId);
-    const entry = { driveId: newFolder.id, lastSyncedMtime: 0, remoteMtime: newFolder.modifiedTime, etag: "" };
+    await this.saveVaultRootState(newFolder);
+    return newFolder.id;
+  }
+  async saveVaultRootState(folder) {
+    const stateKey = `__VAULT_ROOT__`;
+    const entry = { driveId: folder.id, lastSyncedMtime: 0, remoteMtime: folder.modifiedTime, etag: "" };
     this.stateManager.set(stateKey, entry);
     await this.flushStateIfNeeded(true);
-    return newFolder.id;
+  }
+  async selectPullVaultRoot(name, candidates, stateDriveId) {
+    const stateCandidate = candidates.find((folder) => folder.id === stateDriveId);
+    const scoredCandidates = await Promise.all(candidates.map(async (folder) => ({
+      folder,
+      childCount: await this.getImmediateRemoteChildCount(folder.id)
+    })));
+    const nonEmptyCandidates = scoredCandidates.filter((candidate) => candidate.childCount > 0);
+    const scoredStateCandidate = nonEmptyCandidates.find((candidate) => candidate.folder.id === stateDriveId);
+    if (scoredStateCandidate)
+      return scoredStateCandidate.folder;
+    if (nonEmptyCandidates.length > 0) {
+      const selected = nonEmptyCandidates.sort((a, b) => {
+        if (b.childCount !== a.childCount)
+          return b.childCount - a.childCount;
+        return new Date(b.folder.modifiedTime).getTime() - new Date(a.folder.modifiedTime).getTime();
+      })[0].folder;
+      if (stateCandidate && selected.id !== stateCandidate.id) {
+        new import_obsidian5.Notice(`Tether switched Pull from an empty "${name}" Drive folder to a matching folder that contains files.`);
+      }
+      return selected;
+    }
+    if (stateDriveId && !stateCandidate) {
+      const stateChildCount = await this.getImmediateRemoteChildCount(stateDriveId).catch(() => 0);
+      if (stateChildCount > 0) {
+        return {
+          id: stateDriveId,
+          name,
+          mimeType: GOOGLE_FOLDER_MIME_TYPE,
+          modifiedTime: new Date().toISOString()
+        };
+      }
+    }
+    return void 0;
+  }
+  async getImmediateRemoteChildCount(folderId) {
+    const page = await this.client.listFilesPage(folderId);
+    return page.files.length + (page.nextPageToken ? 1 : 0);
   }
   async processRemoteFile(path, remoteFile) {
     if (remoteFile.mimeType === "application/vnd.google-apps.folder") {
