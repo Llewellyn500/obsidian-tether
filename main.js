@@ -1654,6 +1654,8 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
       "Log in with your Google account.",
       "You will be redirected to Tether's callback page. Copy the full URL shown there.",
       'Paste that URL into the "Authorization URL" box in Obsidian and click Verify Login.',
+      "Select your Google Drive folder. Tether will start with an initial push from this local vault.",
+      "On future app opens and after plugin updates, Tether pulls Drive changes first. The interval timer pushes local edits back to Drive.",
       "If Select Folder shows a 403 error, confirm Google Drive API is enabled, the required Drive scopes are added, and this Google account is added under Audience > Test users if the app is still in Testing.",
       "If you changed API access, scopes, or test users after logging in, log out of Tether and log in again before selecting a folder.",
       "After your first successful login, return to Audience in Google Cloud and publish the app to In production to avoid weekly re-logins.",
@@ -1693,7 +1695,8 @@ var DEFAULT_SETTINGS = {
   folderName: "",
   syncInterval: 15,
   syncOnStartup: true,
-  initialPullComplete: false
+  initialPullComplete: false,
+  lastPluginVersion: ""
 };
 var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   constructor() {
@@ -1716,15 +1719,22 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     this.registerEvent(this.app.vault.on("modify", markLocalChange));
     this.registerEvent(this.app.vault.on("delete", markLocalChange));
     this.registerEvent(this.app.vault.on("rename", markLocalChange));
+    const pluginVersionChanged = this.settings.lastPluginVersion !== this.manifest.version;
     if (this.settings.accessToken) {
       this.initializeClient();
       this.setupSyncEngine();
-      if (this.settings.syncOnStartup && this.settings.folderId) {
+      if ((this.settings.syncOnStartup || pluginVersionChanged) && this.settings.folderId) {
         setTimeout(() => {
-          new import_obsidian8.Notice("Google Drive: Checking for updates...");
-          this.backgroundSync();
+          new import_obsidian8.Notice(pluginVersionChanged ? "Google Drive: Pulling changes after plugin update..." : "Google Drive: Pulling startup changes...");
+          this.startupPullSync();
         }, 5e3);
+      } else if (pluginVersionChanged) {
+        this.settings.lastPluginVersion = this.manifest.version;
+        await this.saveSettings();
       }
+    } else if (pluginVersionChanged) {
+      this.settings.lastPluginVersion = this.manifest.version;
+      await this.saveSettings();
     }
     const pullRibbonIconEl = this.addRibbonIcon("cloud-download", "Pull from Google Drive", (evt) => {
       this.pullSync();
@@ -1736,7 +1746,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     pushRibbonIconEl.addClass("gdrive-sync-ribbon-icon");
     this.addCommand({
       id: "sync-google-drive",
-      name: "Run Next Tether Sync",
+      name: "Run Tether Push Sync",
       callback: () => this.manualSync()
     });
     this.addCommand({
@@ -1888,14 +1898,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
   }
   async manualSync() {
-    if (!this.settings.initialPullComplete) {
-      await this.runSync("pull");
-      if (this.settings.initialPullComplete && !this.isSyncing) {
-        await this.runSync("push");
-      }
-    } else {
-      await this.runSync("push");
-    }
+    await this.runSync("push");
   }
   async pullSync() {
     await this.runSync("pull");
@@ -1904,7 +1907,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     await this.runSync("push");
   }
   async runSync(mode, options = {}) {
-    var _a;
+    var _a, _b;
     if (this.isSyncing) {
       new import_obsidian8.Notice("Sync is already in progress.");
       return;
@@ -1925,13 +1928,22 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       await this.activateView();
     }
     this.setupSyncEngine();
-    if (!options.silent) {
+    if (!options.silent && ((_b = options.showStartNotice) != null ? _b : true)) {
       new import_obsidian8.Notice(`Starting Tether ${mode}...`);
     }
     try {
       await this.syncEngine.sync({ mode, silent: options.silent });
-      if (mode === "pull" && this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0) {
+      const syncCompleted = this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0;
+      let settingsChanged = false;
+      if (!this.settings.initialPullComplete && syncCompleted) {
         this.settings.initialPullComplete = true;
+        settingsChanged = true;
+      }
+      if (mode === "pull" && syncCompleted && this.settings.lastPluginVersion !== this.manifest.version) {
+        this.settings.lastPluginVersion = this.manifest.version;
+        settingsChanged = true;
+      }
+      if (settingsChanged) {
         await this.saveSettings();
       }
     } catch (error) {
@@ -1945,19 +1957,17 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.isSyncing = false;
     }
   }
+  async startupPullSync() {
+    if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
+      return;
+    await this.runSync("pull", { revealStatus: false, showStartNotice: false });
+  }
   async backgroundSync() {
     if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
       return;
     if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS)
       return;
-    if (!this.settings.initialPullComplete) {
-      await this.runSync("pull", { silent: true, revealStatus: false });
-      if (this.settings.initialPullComplete && !this.isSyncing) {
-        await this.runSync("push", { silent: true, revealStatus: false });
-      }
-    } else {
-      await this.runSync("push", { silent: true, revealStatus: false });
-    }
+    await this.runSync("push", { silent: true, revealStatus: false });
   }
   async startLogin() {
     if (!this.settings.clientId || !this.settings.clientSecret) {
@@ -2102,8 +2112,8 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
           this.plugin.settings.folderName = folder.name;
           await this.plugin.saveSettings();
           this.display();
-          new import_obsidian8.Notice(`Sync folder set to ${folder.name}.`);
-          this.plugin.manualSync();
+          new import_obsidian8.Notice(`Sync folder set to ${folder.name}. Starting initial push...`);
+          this.plugin.pushSync();
         }).open();
       });
     });
@@ -2111,15 +2121,15 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       return;
     const step4 = containerEl.createEl("div", { cls: "gdrive-setup-step" });
     step4.createEl("h3", { text: "Step 4: Sync Settings" });
-    new import_obsidian8.Setting(step4).setName("Sync on Startup").setDesc("Automatically check for changes when Obsidian opens.").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
+    new import_obsidian8.Setting(step4).setName("Sync on Startup").setDesc("Pull Google Drive changes when Obsidian opens.").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
       this.plugin.settings.syncOnStartup = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Sync Interval (minutes)").setDesc("Minutes between automatic syncs (0 to disable).").addText((text) => text.setPlaceholder("15").setValue(this.plugin.settings.syncInterval.toString()).onChange(async (value) => {
+    new import_obsidian8.Setting(step4).setName("Sync Interval (minutes)").setDesc("Minutes between automatic pushes to Google Drive (0 to disable).").addText((text) => text.setPlaceholder("15").setValue(this.plugin.settings.syncInterval.toString()).onChange(async (value) => {
       this.plugin.settings.syncInterval = parseInt(value) || 0;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc(this.plugin.settings.initialPullComplete ? "Next automatic sync will push local changes." : "Next automatic sync will pull from Google Drive first.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync()));
+    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc("Startup pulls Drive changes. The timer and manual sync push local changes.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync()));
   }
 };
 module.exports = __toCommonJS(main_exports);

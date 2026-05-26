@@ -2,7 +2,7 @@
 
 Tether is a Google Drive sync plugin for Obsidian that keeps your vault structure in sync using your own Google Cloud project and Google account.
 
-> Pull notes from Google Drive first, then push local changes back as Drive revisions.
+> Push during setup, pull when Obsidian opens, then push local changes back on the timer.
 
 ## Why Tether
 
@@ -17,7 +17,7 @@ Tether is built for people who want a self-managed sync workflow across desktop 
 | Your own credentials | Uses your Google Cloud OAuth client instead of a shared backend |
 | Mobile-friendly networking | Uses Obsidian's `requestUrl` API for Google OAuth and Drive requests |
 | Built-in setup flow | Includes an in-app setup guide, login flow, folder picker, and sync status sidebar |
-| Automatic syncing | Supports sync on startup and interval-based background sync |
+| Automatic syncing | Pulls on startup and pushes on the configured interval |
 
 ## How it works
 
@@ -56,7 +56,7 @@ Until the community listing is live, you can install Tether manually:
 4. Add your Google Cloud `Client ID` and `Client Secret`.
 5. Select `Open Login Page`, sign in with Google, and paste the returned URL into `Authorization URL`.
 6. Choose the Google Drive folder you want Tether to use.
-7. Run `Pull from Google Drive` for the first sync, then use `Push to Google Drive` for local changes.
+7. Tether starts an initial push after folder selection. When Obsidian opens later, Tether pulls Drive changes first, and the interval timer pushes local changes.
 
 > Important: if your Google Cloud OAuth app stays `External` + `Testing`, Google issues Drive refresh tokens that expire after 7 days. After confirming the setup works, move the OAuth app to `In production` in Google Cloud, then log in to Tether once more so Google issues a new refresh token. Tether can refresh normal access tokens automatically, but no local plugin can keep using a refresh token after Google expires or revokes it.
 
@@ -72,7 +72,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 
 ## Commands
 
-- `Run Next Tether Sync`
+- `Run Tether Push Sync`
 - `Pull from Google Drive`
 - `Push to Google Drive`
 - `Open Sync Status Sidebar`
@@ -81,10 +81,13 @@ If you already have Tether working on another device, the easiest iOS setup is t
 
 - Tether syncs Markdown notes, attachments, nested folders, and the `.obsidian` folder.
 - Tether creates a dedicated vault folder inside the Google Drive folder you select.
-- The first automatic sync pulls from Google Drive. Later automatic syncs push local changes to Google Drive.
+- Initial setup pushes your local vault into the selected Google Drive folder.
+- Startup sync pulls Google Drive changes when Obsidian opens, which helps devices catch up after being unused for days.
+- After a plugin update, Tether also pulls Google Drive changes on load so the local vault matches the remote before interval pushes resume.
+- Interval sync pushes local changes to Google Drive.
 - Pull replaces local files with the Google Drive version, while deferring open or recently edited local files.
 - Pull mirrors remote deletions locally; push mirrors local deletions to Google Drive.
-- If a manual pull or push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
+- If a startup/manual pull or manual push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
 - Tether checks each Drive folder for duplicate same-name files, folds differing duplicate content into the chosen file's Drive revision history, then removes the extra Drive files.
 - Tether excludes `.git`, `.trash`, and its own sync state file at `.obsidian/gdrive-sync.json`.

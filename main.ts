@@ -25,6 +25,7 @@ interface GoogleDriveSyncSettings {
 	syncInterval: number;
 	syncOnStartup: boolean;
 	initialPullComplete: boolean;
+	lastPluginVersion: string;
 }
 
 const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
@@ -41,6 +42,7 @@ const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 	syncInterval: 15,
 	syncOnStartup: true,
 	initialPullComplete: false,
+	lastPluginVersion: '',
 }
 
 export default class GoogleDriveSyncPlugin extends Plugin {
@@ -75,16 +77,23 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on('delete', markLocalChange));
 		this.registerEvent(this.app.vault.on('rename', markLocalChange));
 
+		const pluginVersionChanged = this.settings.lastPluginVersion !== this.manifest.version;
 		if (this.settings.accessToken) {
 			this.initializeClient();
 			this.setupSyncEngine();
 			
-			if (this.settings.syncOnStartup && this.settings.folderId) {
+			if ((this.settings.syncOnStartup || pluginVersionChanged) && this.settings.folderId) {
 				setTimeout(() => {
-					new Notice('Google Drive: Checking for updates...');
-					this.backgroundSync();
+					new Notice(pluginVersionChanged ? 'Google Drive: Pulling changes after plugin update...' : 'Google Drive: Pulling startup changes...');
+					this.startupPullSync();
 				}, 5000); 
+			} else if (pluginVersionChanged) {
+				this.settings.lastPluginVersion = this.manifest.version;
+				await this.saveSettings();
 			}
+		} else if (pluginVersionChanged) {
+			this.settings.lastPluginVersion = this.manifest.version;
+			await this.saveSettings();
 		}
 
 		// Add ribbon icons
@@ -101,7 +110,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		// Add command palette shortcuts
 		this.addCommand({
 			id: 'sync-google-drive',
-			name: 'Run Next Tether Sync',
+			name: 'Run Tether Push Sync',
 			callback: () => this.manualSync()
 		});
 
@@ -287,16 +296,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async manualSync() {
-		if (!this.settings.initialPullComplete) {
-			// First pull from remote to pick up any existing files
-			await this.runSync('pull');
-			// After a successful initial pull, immediately push local content
-			if (this.settings.initialPullComplete && !this.isSyncing) {
-				await this.runSync('push');
-			}
-		} else {
-			await this.runSync('push');
-		}
+		await this.runSync('push');
 	}
 
 	async pullSync() {
@@ -307,7 +307,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		await this.runSync('push');
 	}
 
-	private async runSync(mode: SyncMode, options: { silent?: boolean, revealStatus?: boolean } = {}) {
+	private async runSync(mode: SyncMode, options: { silent?: boolean, revealStatus?: boolean, showStartNotice?: boolean } = {}) {
 		if (this.isSyncing) {
 			new Notice('Sync is already in progress.');
 			return;
@@ -330,13 +330,22 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		}
 		this.setupSyncEngine();
 
-		if (!options.silent) {
+		if (!options.silent && (options.showStartNotice ?? true)) {
 			new Notice(`Starting Tether ${mode}...`);
 		}
 		try {
 			await this.syncEngine.sync({ mode, silent: options.silent });
-			if (mode === 'pull' && this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0) {
+			const syncCompleted = this.syncEngine.stats.failed === 0 && this.syncEngine.stats.deferred.length === 0;
+			let settingsChanged = false;
+			if (!this.settings.initialPullComplete && syncCompleted) {
 				this.settings.initialPullComplete = true;
+				settingsChanged = true;
+			}
+			if (mode === 'pull' && syncCompleted && this.settings.lastPluginVersion !== this.manifest.version) {
+				this.settings.lastPluginVersion = this.manifest.version;
+				settingsChanged = true;
+			}
+			if (settingsChanged) {
 				await this.saveSettings();
 			}
 		} catch (error) {
@@ -351,19 +360,16 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		}
 	}
 
+	async startupPullSync() {
+		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		await this.runSync('pull', { revealStatus: false, showStartNotice: false });
+	}
+
 	async backgroundSync() {
 		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
 		if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS) return;
 
-		if (!this.settings.initialPullComplete) {
-			await this.runSync('pull', { silent: true, revealStatus: false });
-			// After a successful initial pull, immediately push local content
-			if (this.settings.initialPullComplete && !this.isSyncing) {
-				await this.runSync('push', { silent: true, revealStatus: false });
-			}
-		} else {
-			await this.runSync('push', { silent: true, revealStatus: false });
-		}
+		await this.runSync('push', { silent: true, revealStatus: false });
 	}
 
 	async startLogin() {
@@ -595,8 +601,8 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 						this.plugin.settings.folderName = folder.name;
 						await this.plugin.saveSettings();
 						this.display();
-						new Notice(`Sync folder set to ${folder.name}.`);
-						this.plugin.manualSync();
+						new Notice(`Sync folder set to ${folder.name}. Starting initial push...`);
+						this.plugin.pushSync();
 					}).open();
 				});
 			});
@@ -609,7 +615,7 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 
 		new Setting(step4)
 			.setName('Sync on Startup')
-			.setDesc('Automatically check for changes when Obsidian opens.')
+			.setDesc('Pull Google Drive changes when Obsidian opens.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.syncOnStartup)
 				.onChange(async (value) => {
@@ -619,7 +625,7 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 
 		new Setting(step4)
 			.setName('Sync Interval (minutes)')
-			.setDesc('Minutes between automatic syncs (0 to disable).')
+			.setDesc('Minutes between automatic pushes to Google Drive (0 to disable).')
 			.addText(text => text
 				.setPlaceholder('15')
 				.setValue(this.plugin.settings.syncInterval.toString())
@@ -630,7 +636,7 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 
 		new Setting(step4)
 			.setName('Manual Sync')
-			.setDesc(this.plugin.settings.initialPullComplete ? 'Next automatic sync will push local changes.' : 'Next automatic sync will pull from Google Drive first.')
+			.setDesc('Startup pulls Drive changes. The timer and manual sync push local changes.')
 			.addButton(btn => btn
 				.setButtonText('Pull')
 				.onClick(() => this.plugin.pullSync()))
