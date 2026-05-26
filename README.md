@@ -84,6 +84,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - The first automatic sync pulls from Google Drive. Later automatic syncs push local changes to Google Drive.
 - Pull replaces local files with the Google Drive version, while deferring open or recently edited local files.
 - Pull mirrors remote deletions locally; push mirrors local deletions to Google Drive.
+- If a manual pull or push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
 - Tether checks each Drive folder for duplicate same-name files, folds differing duplicate content into the chosen file's Drive revision history, then removes the extra Drive files.
 - Tether excludes `.git`, `.trash`, and its own sync state file at `.obsidian/gdrive-sync.json`.

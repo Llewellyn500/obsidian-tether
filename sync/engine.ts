@@ -247,6 +247,22 @@ export class SyncEngine {
 		return status === 404 || this.getErrorMessage(error).includes('404');
 	}
 
+	private shouldProceedWithLargeDeletion(mode: SyncMode, count: number, trackedCount: number): boolean {
+		const percent = Math.round((count / trackedCount) * 100);
+		const target = mode === 'pull' ? 'local' : 'remote';
+		const source = mode === 'pull' ? 'Google Drive' : 'this device';
+		const staleDeviceNote = mode === 'pull'
+			? '\n\nThis can be normal when this device has not pulled changes for a while and the other device moved or deleted many files.'
+			: '';
+		const msg = `${mode === 'pull' ? 'Pull' : 'Push'} wants to delete ${count} of ${trackedCount} tracked ${target} files (${percent}%) because they are missing from ${source}.${staleDeviceNote}\n\nContinue only if this matches what you expect.`;
+
+		if (this.silent) {
+			return false;
+		}
+
+		return window.confirm(msg);
+	}
+
 	private getErrorMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
 	}
@@ -671,12 +687,16 @@ export class SyncEngine {
 		// Safeguard: abort if deleting too many remote files at once
 		if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED &&
 			deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
-			const msg = `Push aborted: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No remote files were deleted.`;
-			console.error(msg);
-			new Notice(msg);
-			this.stats.failed++;
-			this.stats.errors.push({ path: 'Remote deletions', message: msg });
-			return locallyDeletedPaths;
+			if (!this.shouldProceedWithLargeDeletion('push', deletionCandidates.length, trackedCount)) {
+				const msg = `Push paused remote deletions: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
+				console.error(msg);
+				new Notice(msg);
+				this.stats.failed++;
+				this.stats.errors.push({ path: 'Remote deletions', message: msg });
+				return locallyDeletedPaths;
+			}
+
+			new Notice(`Confirmed large push deletion batch: deleting ${deletionCandidates.length} remote files.`);
 		}
 
 		for (const [path, entry] of deletionCandidates) {
@@ -719,12 +739,16 @@ export class SyncEngine {
 		// Safeguard: abort if deleting too many local files at once
 		if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED &&
 			deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
-			const msg = `Pull aborted deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No local files were deleted.`;
-			console.error(msg);
-			new Notice(msg);
-			this.stats.failed++;
-			this.stats.errors.push({ path: 'Local deletions', message: msg });
-			return;
+			if (!this.shouldProceedWithLargeDeletion('pull', deletionCandidates.length, trackedCount)) {
+				const msg = `Pull paused local deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No local files were deleted.`;
+				console.error(msg);
+				new Notice(msg);
+				this.stats.failed++;
+				this.stats.errors.push({ path: 'Local deletions', message: msg });
+				return;
+			}
+
+			new Notice(`Confirmed large pull deletion batch: deleting ${deletionCandidates.length} local files.`);
 		}
 
 		for (const [path, entry] of deletionCandidates) {

@@ -812,6 +812,19 @@ var SyncEngine = class {
     const status = typeof error === "object" && error !== null && "status" in error ? error.status : void 0;
     return status === 404 || this.getErrorMessage(error).includes("404");
   }
+  shouldProceedWithLargeDeletion(mode, count, trackedCount) {
+    const percent = Math.round(count / trackedCount * 100);
+    const target = mode === "pull" ? "local" : "remote";
+    const source = mode === "pull" ? "Google Drive" : "this device";
+    const staleDeviceNote = mode === "pull" ? "\n\nThis can be normal when this device has not pulled changes for a while and the other device moved or deleted many files." : "";
+    const msg = `${mode === "pull" ? "Pull" : "Push"} wants to delete ${count} of ${trackedCount} tracked ${target} files (${percent}%) because they are missing from ${source}.${staleDeviceNote}
+
+Continue only if this matches what you expect.`;
+    if (this.silent) {
+      return false;
+    }
+    return window.confirm(msg);
+  }
   getErrorMessage(error) {
     return error instanceof Error ? error.message : String(error);
   }
@@ -1176,12 +1189,15 @@ var SyncEngine = class {
       }
     }
     if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
-      const msg = `Push aborted: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No remote files were deleted.`;
-      console.error(msg);
-      new import_obsidian5.Notice(msg);
-      this.stats.failed++;
-      this.stats.errors.push({ path: "Remote deletions", message: msg });
-      return locallyDeletedPaths;
+      if (!this.shouldProceedWithLargeDeletion("push", deletionCandidates.length, trackedCount)) {
+        const msg = `Push paused remote deletions: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
+        console.error(msg);
+        new import_obsidian5.Notice(msg);
+        this.stats.failed++;
+        this.stats.errors.push({ path: "Remote deletions", message: msg });
+        return locallyDeletedPaths;
+      }
+      new import_obsidian5.Notice(`Confirmed large push deletion batch: deleting ${deletionCandidates.length} remote files.`);
     }
     for (const [path, entry] of deletionCandidates) {
       try {
@@ -1213,12 +1229,15 @@ var SyncEngine = class {
     const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
     const trackedCount = sortedEntries.length;
     if (trackedCount >= CATASTROPHIC_DELETE_MIN_TRACKED && deletionCandidates.length / trackedCount > CATASTROPHIC_DELETE_RATIO) {
-      const msg = `Pull aborted deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). This may indicate a problem. No local files were deleted.`;
-      console.error(msg);
-      new import_obsidian5.Notice(msg);
-      this.stats.failed++;
-      this.stats.errors.push({ path: "Local deletions", message: msg });
-      return;
+      if (!this.shouldProceedWithLargeDeletion("pull", deletionCandidates.length, trackedCount)) {
+        const msg = `Pull paused local deletions: would delete ${deletionCandidates.length} of ${trackedCount} local files (>${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No local files were deleted.`;
+        console.error(msg);
+        new import_obsidian5.Notice(msg);
+        this.stats.failed++;
+        this.stats.errors.push({ path: "Local deletions", message: msg });
+        return;
+      }
+      new import_obsidian5.Notice(`Confirmed large pull deletion batch: deleting ${deletionCandidates.length} local files.`);
     }
     for (const [path, entry] of deletionCandidates) {
       try {
