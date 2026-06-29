@@ -71,6 +71,10 @@ export class SyncStatusView extends ItemView {
 		this.createStat(statsGrid, 'Conflicts', this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? 'text-warning' : '');
 		this.createStat(statsGrid, 'Deferred', this.stats.deferred.length.toString(), this.stats.deferred.length > 0 ? 'text-accent' : '');
 		this.createStat(statsGrid, 'Failed', this.stats.failed.toString(), this.stats.failed > 0 ? 'text-error' : '');
+		const plugin = (this.app as any).plugins.getPlugin('tether');
+		if (plugin) {
+			this.createStat(statsGrid, 'Auto Sync', plugin.settings?.syncPaused ? 'Stopped' : 'On', plugin.settings?.syncPaused ? 'text-warning' : '');
+		}
 
 		if (this.stats.currentFile) {
 			container.createEl('p', { text: `Currently: ${this.stats.currentFile}`, cls: 'current-file-text' });
@@ -158,9 +162,22 @@ export class SyncStatusView extends ItemView {
 		const pushButton = actions.createEl('button', { text: 'Push' });
 		pushButton.onClickEvent(() => plugin?.pushSync?.());
 
+		const stopButton = actions.createEl('button', {
+			text: plugin?.settings?.syncPaused ? 'Resume Auto Sync' : 'Stop Auto Sync',
+			cls: plugin?.settings?.syncPaused ? 'mod-cta' : 'mod-warning'
+		});
+		stopButton.onClickEvent(() => {
+			if (plugin?.settings?.syncPaused) {
+				plugin?.resumeAutomaticSync?.();
+			} else {
+				plugin?.stopAutomaticSync?.();
+			}
+		});
+
 		if (!plugin) {
 			pullButton.disabled = true;
 			pushButton.disabled = true;
+			stopButton.disabled = true;
 		}
 	}
 

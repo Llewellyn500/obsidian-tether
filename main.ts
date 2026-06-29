@@ -1,12 +1,13 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice, addIcon, WorkspaceLeaf } from 'obsidian';
 import { StateManager } from './sync/state';
 import { GoogleDriveClient, isSessionExpiredError } from './sync/gdrive';
-import { SyncEngine, SyncMode } from './sync/engine';
+import { SyncEngine, SyncMode, SyncStoppedError } from './sync/engine';
 import { FolderSuggestModal } from './ui/folder-modal';
 import { SetupGuideModal } from './ui/setup-guide';
 import { OAuthManager, OAuthTokenResponse } from './auth/oauth';
 import { SyncStatusView, VIEW_TYPE_SYNC_STATUS } from './ui/sync-view';
 
+const STARTUP_PULL_DELAY_MS = 5000;
 const BACKGROUND_SYNC_IDLE_DELAY_MS = 60000;
 const ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 55 * 60 * 1000;
@@ -24,6 +25,7 @@ interface GoogleDriveSyncSettings {
 	folderName: string;
 	syncInterval: number;
 	syncOnStartup: boolean;
+	syncPaused: boolean;
 	initialPullComplete: boolean;
 	lastPluginVersion: string;
 }
@@ -41,6 +43,7 @@ const DEFAULT_SETTINGS: GoogleDriveSyncSettings = {
 	folderName: '',
 	syncInterval: 15,
 	syncOnStartup: true,
+	syncPaused: false,
 	initialPullComplete: false,
 	lastPluginVersion: '',
 }
@@ -53,6 +56,9 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	statusBarItem!: HTMLElement;
 	isSyncing: boolean = false;
 	private lastLocalChangeAt = 0;
+	private startupPullTimeoutId: number | null = null;
+	private backgroundSyncIntervalId: number | null = null;
+	private startupPullRanThisSession = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -78,16 +84,13 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		this.registerEvent(this.app.vault.on('rename', markLocalChange));
 
 		const pluginVersionChanged = this.settings.lastPluginVersion !== this.manifest.version;
+		let shouldScheduleStartupPull = false;
 		if (this.settings.accessToken) {
 			this.initializeClient();
 			this.setupSyncEngine();
 			
-			if ((this.settings.syncOnStartup || pluginVersionChanged) && this.settings.folderId) {
-				setTimeout(() => {
-					new Notice(pluginVersionChanged ? 'Google Drive: Pulling changes after plugin update...' : 'Google Drive: Pulling startup changes...');
-					this.startupPullSync();
-				}, 5000); 
-			} else if (pluginVersionChanged) {
+			shouldScheduleStartupPull = (this.settings.syncOnStartup || pluginVersionChanged) && !!this.settings.folderId;
+			if (!shouldScheduleStartupPull && pluginVersionChanged) {
 				this.settings.lastPluginVersion = this.manifest.version;
 				await this.saveSettings();
 			}
@@ -106,6 +109,11 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			this.pushSync();
 		});
 		pushRibbonIconEl.addClass('gdrive-sync-ribbon-icon');
+
+		const stopRibbonIconEl = this.addRibbonIcon('pause', 'Stop Tether auto sync', (evt: MouseEvent) => {
+			this.stopAutomaticSync();
+		});
+		stopRibbonIconEl.addClass('gdrive-sync-ribbon-icon');
 
 		// Add command palette shortcuts
 		this.addCommand({
@@ -127,6 +135,18 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: 'stop-google-drive-auto-sync',
+			name: 'Stop Tether Auto Sync',
+			callback: () => this.stopAutomaticSync()
+		});
+
+		this.addCommand({
+			id: 'resume-google-drive-auto-sync',
+			name: 'Resume Tether Auto Sync',
+			callback: () => this.resumeAutomaticSync()
+		});
+
+		this.addCommand({
 			id: 'open-gdrive-sync-status',
 			name: 'Open Sync Status Sidebar',
 			callback: () => this.activateView()
@@ -135,9 +155,10 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		// Add settings tab
 		this.addSettingTab(new GoogleDriveSyncSettingTab(this.app, this));
 
-		// Register intervals
-		if (this.settings.syncInterval > 0) {
-			this.registerInterval(window.setInterval(() => this.backgroundSync(), this.settings.syncInterval * 60 * 1000));
+		if (shouldScheduleStartupPull) {
+			this.scheduleStartupPullSync(pluginVersionChanged);
+		} else {
+			this.scheduleBackgroundSync();
 		}
 
 		console.log('Google Drive Sync plugin loaded');
@@ -161,6 +182,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async onunload() {
+		this.clearAutomaticSyncTimers();
 		console.log('Google Drive Sync plugin unloaded');
 	}
 
@@ -195,6 +217,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async saveSettings() {
+		const hadStartupPullPending = this.startupPullTimeoutId !== null;
 		const oldFolderId = (await this.loadData())?.folderId;
 		const folderChanged = !!this.settings.folderId && this.settings.folderId !== oldFolderId;
 		if (folderChanged) {
@@ -213,6 +236,10 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			this.initializeClient();
 			this.setupSyncEngine();
 		}
+
+		const shouldKeepStartupPullPending = hadStartupPullPending &&
+			(this.settings.syncOnStartup || this.settings.lastPluginVersion !== this.manifest.version);
+		this.refreshAutomaticSyncTimers(shouldKeepStartupPullPending);
 	}
 
 	private applyTokenResponse(tokens: OAuthTokenResponse) {
@@ -307,6 +334,37 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 		await this.runSync('push');
 	}
 
+	async stopAutomaticSync() {
+		const wasSyncing = this.isSyncing;
+		this.settings.syncPaused = true;
+		this.clearAutomaticSyncTimers();
+
+		if (this.syncEngine && wasSyncing) {
+			this.syncEngine.requestStop();
+		}
+
+		await this.saveSettings();
+		if (this.syncEngine && !wasSyncing) {
+			this.syncEngine.updateStatus('Auto sync stopped', { currentFile: '' }, true);
+		}
+		this.refreshStatusViews();
+
+		new Notice(wasSyncing ? 'Tether auto sync stopped. Current sync is stopping...' : 'Tether auto sync stopped.');
+	}
+
+	async resumeAutomaticSync() {
+		this.settings.syncPaused = false;
+		await this.saveSettings();
+
+		if (this.syncEngine && !this.isSyncing) {
+			this.syncEngine.updateStatus('Idle', { currentFile: '' }, true);
+		}
+		this.refreshAutomaticSyncTimers(this.settings.syncOnStartup && !this.startupPullRanThisSession);
+		this.refreshStatusViews();
+
+		new Notice('Tether auto sync resumed.');
+	}
+
 	private async runSync(mode: SyncMode, options: { silent?: boolean, revealStatus?: boolean, showStartNotice?: boolean } = {}) {
 		if (this.isSyncing) {
 			new Notice('Sync is already in progress.');
@@ -349,11 +407,18 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 				await this.saveSettings();
 			}
 		} catch (error) {
-			console.error(`${mode} failed`, error);
-			if (isSessionExpiredError(error)) {
+			if (error instanceof SyncStoppedError) {
+				this.syncEngine.updateStatus('Stopped', { currentFile: '' }, true);
+				if (!options.silent) {
+					new Notice('Sync stopped.');
+				}
+			} else if (isSessionExpiredError(error)) {
 				await this.handleExpiredSession(true);
 			} else if (!options.silent) {
+				console.error(`${mode} failed`, error);
 				new Notice(`${mode === 'pull' ? 'Pull' : 'Push'} failed: ${error instanceof Error ? error.message : String(error)}`);
+			} else {
+				console.error(`${mode} failed`, error);
 			}
 		} finally {
 			this.isSyncing = false;
@@ -361,15 +426,84 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	}
 
 	async startupPullSync() {
-		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		if (this.settings.syncPaused || this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		this.startupPullRanThisSession = true;
 		await this.runSync('pull', { revealStatus: false, showStartNotice: false });
 	}
 
 	async backgroundSync() {
-		if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
+		if (this.settings.syncPaused || this.isSyncing || !this.settings.accessToken || !this.settings.folderId) return;
 		if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS) return;
 
 		await this.runSync('push', { silent: true, revealStatus: false });
+	}
+
+	private scheduleStartupPullSync(pluginVersionChanged = false) {
+		this.clearStartupPullTimeout();
+		this.clearBackgroundSyncInterval();
+
+		if (this.settings.syncPaused || !this.settings.accessToken || !this.settings.folderId) return;
+
+		this.startupPullTimeoutId = window.setTimeout(async () => {
+			this.startupPullTimeoutId = null;
+			if (this.settings.syncPaused) return;
+
+			new Notice(pluginVersionChanged ? 'Google Drive: Pulling changes after plugin update...' : 'Google Drive: Pulling startup changes...');
+			try {
+				await this.startupPullSync();
+			} finally {
+				this.scheduleBackgroundSync();
+			}
+		}, STARTUP_PULL_DELAY_MS);
+	}
+
+	private scheduleBackgroundSync() {
+		this.clearBackgroundSyncInterval();
+
+		if (this.settings.syncPaused || !this.settings.accessToken || !this.settings.folderId || this.settings.syncInterval <= 0) return;
+
+		this.backgroundSyncIntervalId = window.setInterval(() => this.backgroundSync(), this.settings.syncInterval * 60 * 1000);
+		this.registerInterval(this.backgroundSyncIntervalId);
+	}
+
+	private refreshAutomaticSyncTimers(runStartupPull = false) {
+		if (!this.statusBarItem) return;
+
+		this.clearAutomaticSyncTimers();
+		if (runStartupPull) {
+			this.scheduleStartupPullSync(this.settings.lastPluginVersion !== this.manifest.version);
+		} else {
+			this.scheduleBackgroundSync();
+		}
+	}
+
+	private clearAutomaticSyncTimers() {
+		this.clearStartupPullTimeout();
+		this.clearBackgroundSyncInterval();
+	}
+
+	private clearStartupPullTimeout() {
+		if (this.startupPullTimeoutId !== null) {
+			window.clearTimeout(this.startupPullTimeoutId);
+			this.startupPullTimeoutId = null;
+		}
+	}
+
+	private clearBackgroundSyncInterval() {
+		if (this.backgroundSyncIntervalId !== null) {
+			window.clearInterval(this.backgroundSyncIntervalId);
+			this.backgroundSyncIntervalId = null;
+		}
+	}
+
+	private refreshStatusViews() {
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
+		for (const leaf of leaves) {
+			const view = leaf.view as SyncStatusView;
+			if (typeof view.render === 'function') {
+				view.render();
+			}
+		}
 	}
 
 	async startLogin() {
@@ -643,6 +777,16 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 			.addButton(btn => btn
 				.setButtonText('Push')
 				.setCta()
-				.onClick(() => this.plugin.pushSync()));
+				.onClick(() => this.plugin.pushSync()))
+			.addButton(btn => btn
+				.setButtonText(this.plugin.settings.syncPaused ? 'Resume Auto Sync' : 'Stop Auto Sync')
+				.onClick(async () => {
+					if (this.plugin.settings.syncPaused) {
+						await this.plugin.resumeAutomaticSync();
+					} else {
+						await this.plugin.stopAutomaticSync();
+					}
+					this.display();
+				}));
 	}
 }

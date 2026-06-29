@@ -75,6 +75,8 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - `Run Tether Push Sync`
 - `Pull from Google Drive`
 - `Push to Google Drive`
+- `Stop Tether Auto Sync`
+- `Resume Tether Auto Sync`
 - `Open Sync Status Sidebar`
 
 ## Sync behavior
@@ -85,6 +87,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Startup sync pulls Google Drive changes when Obsidian opens, which helps devices catch up after being unused for days.
 - After a plugin update, Tether also pulls Google Drive changes on load so the local vault matches the remote before interval pushes resume.
 - Interval sync pushes local changes to Google Drive.
+- Stop Auto Sync pauses startup and interval syncing; manual Pull and Push remain available.
 - Pull replaces local files with the Google Drive version, while deferring open or recently edited local files.
 - If a previous pull saved an empty duplicate Drive vault root, Pull looks for a non-empty matching vault folder and switches back to it before downloading.
 - Pull mirrors remote deletions locally; push mirrors local deletions to Google Drive.

@@ -1,6 +1,6 @@
 {
   "name": "tether",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "A high-performance Google Drive sync engine by Llewellyn Paintsil.",
   "main": "main.js",
   "scripts": {

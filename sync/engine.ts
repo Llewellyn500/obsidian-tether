@@ -16,6 +16,13 @@ const CATASTROPHIC_DELETE_RATIO = 0.8;
 export type SyncMode = 'pull' | 'push';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 
+export class SyncStoppedError extends Error {
+	constructor() {
+		super('Sync stopped by user.');
+		this.name = 'SyncStoppedError';
+	}
+}
+
 interface SyncOptions {
 	mode?: SyncMode;
 	silent?: boolean;
@@ -34,6 +41,7 @@ export class SyncEngine {
 	private statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
 	private lastStatusUpdateAt = 0;
 	private processedSinceYield = 0;
+	private stopRequested = false;
 	
 	public stats: SyncStats = {
 		totalFiles: 0,
@@ -53,6 +61,11 @@ export class SyncEngine {
 		this.stateManager = stateManager;
 		this.folderId = folderId;
 		this.statusBarItem = statusBarItem;
+	}
+
+	requestStop() {
+		this.stopRequested = true;
+		this.updateStatus('Stopping...', undefined, true);
 	}
 
 	updateStatus(text: string, partialStats?: Partial<SyncStats>, force = false) {
@@ -90,6 +103,7 @@ export class SyncEngine {
 		this.statusUpdateIntervalMs = options.statusUpdateIntervalMs ?? (this.silent ? BACKGROUND_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS);
 		this.lastStatusUpdateAt = 0;
 		this.processedSinceYield = 0;
+		this.stopRequested = false;
 
 		try {
 			this.stats.processed = 0;
@@ -110,6 +124,7 @@ export class SyncEngine {
 			
 			const vaultRootDriveId = await this.ensureVaultRoot(vaultName, mode === 'push');
 			this.folderCache.set('', vaultRootDriveId);
+			this.throwIfStopped();
 
 			if (mode === 'pull') {
 				await this.pullFromRemote(vaultRootDriveId);
@@ -130,6 +145,11 @@ export class SyncEngine {
 				new Notice(`${modeLabel} complete successfully!`);
 			}
 		} catch (error) {
+			if (error instanceof SyncStoppedError) {
+				this.updateStatus('Stopped', { currentFile: '' }, true);
+				throw error;
+			}
+
 			this.updateStatus('Failed', undefined, true);
 			console.error('Critical sync failure', error);
 			throw error;
@@ -162,11 +182,14 @@ export class SyncEngine {
 		this.updateStatus('Scanning local items...');
 		const localPathSet = await this.collectLocalPathSet('');
 		this.stats.totalFiles = localPathSet.size;
+		this.throwIfStopped();
 
 		await this.handleLocalDeletions(localPathSet);
+		this.throwIfStopped();
 
 		this.updateStatus('Pushing changes...');
 		for (const path of localPathSet) {
+			this.throwIfStopped();
 			this.stats.processed++;
 			this.stats.currentFile = path;
 			if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
@@ -240,11 +263,19 @@ export class SyncEngine {
 
 	private async afterWorkItem() {
 		await this.flushStateIfNeeded();
+		this.throwIfStopped();
 
 		this.processedSinceYield++;
 		if (this.processedSinceYield >= WORK_YIELD_ITEM_LIMIT) {
 			this.processedSinceYield = 0;
 			await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+			this.throwIfStopped();
+		}
+	}
+
+	private throwIfStopped() {
+		if (this.stopRequested) {
+			throw new SyncStoppedError();
 		}
 	}
 
@@ -280,15 +311,18 @@ export class SyncEngine {
 	}
 
 	private async collectLocalPathSet(folderPath: string, items: Set<string> = new Set()): Promise<Set<string>> {
+		this.throwIfStopped();
 		const result = await this.app.vault.adapter.list(folderPath);
 		
 		for (const file of result.files) {
+			this.throwIfStopped();
 			if (!this.isExcluded(file)) {
 				items.add(file);
 			}
 		}
 		
 		for (const folder of result.folders) {
+			this.throwIfStopped();
 			if (!this.isExcluded(folder)) {
 				items.add(folder);
 				await this.collectLocalPathSet(folder, items);
@@ -535,12 +569,14 @@ export class SyncEngine {
 
 	private async processRemoteTree(folderId: string, remotePathSet: Set<string>, parentPath: string = '', depth: number = 0, locallyDeletedPaths: Set<string> = new Set()): Promise<void> {
 		if (depth > 50) throw new Error('Maximum folder depth reached.');
+		this.throwIfStopped();
 		this.updateStatus(`Scanning Drive: ${parentPath || 'root'}...`);
 		
 		try {
 			const items = await this.listCanonicalRemoteItems(folderId, parentPath);
 
 			for (const item of items) {
+				this.throwIfStopped();
 				const path = parentPath ? `${parentPath}/${item.name}` : item.name;
 				if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
 					continue;
@@ -738,6 +774,7 @@ export class SyncEngine {
 
 	private async handleLocalDeletions(localPathSet: Set<string>): Promise<Set<string>> {
 		this.updateStatus('Checking for deletions...');
+		this.throwIfStopped();
 		const stateEntries = Object.entries(this.stateManager.state);
 		const locallyDeletedPaths = new Set<string>();
 
@@ -782,6 +819,7 @@ export class SyncEngine {
 		}
 
 		for (const [path, entry] of deletionCandidates) {
+			this.throwIfStopped();
 			try {
 				this.updateStatus(`Deleting remote: ${path}`);
 				await this.client.deleteFile(entry.driveId);
@@ -845,6 +883,7 @@ export class SyncEngine {
 		}
 
 		for (const [path, entry] of deletionCandidates) {
+			this.throwIfStopped();
 			try {
 				if (await this.app.vault.adapter.exists(path)) {
 					this.updateStatus(`Deleting local: ${path}`);
@@ -889,6 +928,8 @@ export class SyncEngine {
 				this.stats.failed++;
 				this.stats.errors.push({ path, message: this.getErrorMessage(e) });
 			}
+
+			await this.afterWorkItem();
 		}
 	}
 
