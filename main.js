@@ -518,6 +518,7 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
     this.render();
   }
   render() {
+    var _a, _b;
     const container = this.containerEl.children[1];
     container.empty();
     container.addClass("gdrive-sync-view");
@@ -529,6 +530,10 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
     this.createStat(statsGrid, "Conflicts", this.stats.conflicts.length.toString(), this.stats.conflicts.length > 0 ? "text-warning" : "");
     this.createStat(statsGrid, "Deferred", this.stats.deferred.length.toString(), this.stats.deferred.length > 0 ? "text-accent" : "");
     this.createStat(statsGrid, "Failed", this.stats.failed.toString(), this.stats.failed > 0 ? "text-error" : "");
+    const plugin = this.app.plugins.getPlugin("tether");
+    if (plugin) {
+      this.createStat(statsGrid, "Auto Sync", ((_a = plugin.settings) == null ? void 0 : _a.syncPaused) ? "Stopped" : "On", ((_b = plugin.settings) == null ? void 0 : _b.syncPaused) ? "text-warning" : "");
+    }
     if (this.stats.currentFile) {
       container.createEl("p", { text: `Currently: ${this.stats.currentFile}`, cls: "current-file-text" });
     }
@@ -598,21 +603,35 @@ ${conflict.path}`)) {
     stat.createDiv({ text: value, cls: "stat-value " + cls });
   }
   createSyncActions(parent) {
+    var _a, _b;
     const plugin = this.app.plugins.getPlugin("tether");
     const actions = parent.createDiv({ cls: "sync-action-row" });
     const pullButton = actions.createEl("button", { text: "Pull", cls: "mod-cta" });
     pullButton.onClickEvent(() => {
-      var _a;
-      return (_a = plugin == null ? void 0 : plugin.pullSync) == null ? void 0 : _a.call(plugin);
+      var _a2;
+      return (_a2 = plugin == null ? void 0 : plugin.pullSync) == null ? void 0 : _a2.call(plugin);
     });
     const pushButton = actions.createEl("button", { text: "Push" });
     pushButton.onClickEvent(() => {
-      var _a;
-      return (_a = plugin == null ? void 0 : plugin.pushSync) == null ? void 0 : _a.call(plugin);
+      var _a2;
+      return (_a2 = plugin == null ? void 0 : plugin.pushSync) == null ? void 0 : _a2.call(plugin);
+    });
+    const stopButton = actions.createEl("button", {
+      text: ((_a = plugin == null ? void 0 : plugin.settings) == null ? void 0 : _a.syncPaused) ? "Resume Auto Sync" : "Stop Auto Sync",
+      cls: ((_b = plugin == null ? void 0 : plugin.settings) == null ? void 0 : _b.syncPaused) ? "mod-cta" : "mod-warning"
+    });
+    stopButton.onClickEvent(() => {
+      var _a2, _b2, _c;
+      if ((_a2 = plugin == null ? void 0 : plugin.settings) == null ? void 0 : _a2.syncPaused) {
+        (_b2 = plugin == null ? void 0 : plugin.resumeAutomaticSync) == null ? void 0 : _b2.call(plugin);
+      } else {
+        (_c = plugin == null ? void 0 : plugin.stopAutomaticSync) == null ? void 0 : _c.call(plugin);
+      }
     });
     if (!plugin) {
       pullButton.disabled = true;
       pushButton.disabled = true;
+      stopButton.disabled = true;
     }
   }
   isConfigPath(path) {
@@ -631,6 +650,12 @@ var BACKGROUND_STATUS_UPDATE_MS = 3e3;
 var WORK_YIELD_ITEM_LIMIT = 25;
 var CATASTROPHIC_DELETE_RATIO = 0.8;
 var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+var SyncStoppedError = class extends Error {
+  constructor() {
+    super("Sync stopped by user.");
+    this.name = "SyncStoppedError";
+  }
+};
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
     this.folderCache = /* @__PURE__ */ new Map();
@@ -639,6 +664,7 @@ var SyncEngine = class {
     this.statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
     this.lastStatusUpdateAt = 0;
     this.processedSinceYield = 0;
+    this.stopRequested = false;
     this.stats = {
       totalFiles: 0,
       processed: 0,
@@ -655,6 +681,10 @@ var SyncEngine = class {
     this.stateManager = stateManager;
     this.folderId = folderId;
     this.statusBarItem = statusBarItem;
+  }
+  requestStop() {
+    this.stopRequested = true;
+    this.updateStatus("Stopping...", void 0, true);
   }
   updateStatus(text, partialStats, force = false) {
     this.stats = { ...this.stats, status: text, ...partialStats };
@@ -684,6 +714,7 @@ var SyncEngine = class {
     this.statusUpdateIntervalMs = (_b = options.statusUpdateIntervalMs) != null ? _b : this.silent ? BACKGROUND_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS;
     this.lastStatusUpdateAt = 0;
     this.processedSinceYield = 0;
+    this.stopRequested = false;
     try {
       this.stats.processed = 0;
       this.stats.failed = 0;
@@ -700,6 +731,7 @@ var SyncEngine = class {
       this.updateStatus(`Locating vault root...`);
       const vaultRootDriveId = await this.ensureVaultRoot(vaultName, mode === "push");
       this.folderCache.set("", vaultRootDriveId);
+      this.throwIfStopped();
       if (mode === "pull") {
         await this.pullFromRemote(vaultRootDriveId);
       } else {
@@ -717,6 +749,10 @@ var SyncEngine = class {
         new import_obsidian5.Notice(`${modeLabel} complete successfully!`);
       }
     } catch (error) {
+      if (error instanceof SyncStoppedError) {
+        this.updateStatus("Stopped", { currentFile: "" }, true);
+        throw error;
+      }
       this.updateStatus("Failed", void 0, true);
       console.error("Critical sync failure", error);
       throw error;
@@ -745,9 +781,12 @@ var SyncEngine = class {
     this.updateStatus("Scanning local items...");
     const localPathSet = await this.collectLocalPathSet("");
     this.stats.totalFiles = localPathSet.size;
+    this.throwIfStopped();
     await this.handleLocalDeletions(localPathSet);
+    this.throwIfStopped();
     this.updateStatus("Pushing changes...");
     for (const path of localPathSet) {
+      this.throwIfStopped();
       this.stats.processed++;
       this.stats.currentFile = path;
       if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
@@ -809,10 +848,17 @@ var SyncEngine = class {
   }
   async afterWorkItem() {
     await this.flushStateIfNeeded();
+    this.throwIfStopped();
     this.processedSinceYield++;
     if (this.processedSinceYield >= WORK_YIELD_ITEM_LIMIT) {
       this.processedSinceYield = 0;
       await new Promise((resolve) => window.setTimeout(resolve, 0));
+      this.throwIfStopped();
+    }
+  }
+  throwIfStopped() {
+    if (this.stopRequested) {
+      throw new SyncStoppedError();
     }
   }
   isNotFound(error) {
@@ -839,13 +885,16 @@ Continue only if this matches what you expect.`;
     return Array.from(await this.collectLocalPathSet(folderPath));
   }
   async collectLocalPathSet(folderPath, items = /* @__PURE__ */ new Set()) {
+    this.throwIfStopped();
     const result = await this.app.vault.adapter.list(folderPath);
     for (const file of result.files) {
+      this.throwIfStopped();
       if (!this.isExcluded(file)) {
         items.add(file);
       }
     }
     for (const folder of result.folders) {
+      this.throwIfStopped();
       if (!this.isExcluded(folder)) {
         items.add(folder);
         await this.collectLocalPathSet(folder, items);
@@ -1059,10 +1108,12 @@ Continue only if this matches what you expect.`;
   async processRemoteTree(folderId, remotePathSet, parentPath = "", depth = 0, locallyDeletedPaths = /* @__PURE__ */ new Set()) {
     if (depth > 50)
       throw new Error("Maximum folder depth reached.");
+    this.throwIfStopped();
     this.updateStatus(`Scanning Drive: ${parentPath || "root"}...`);
     try {
       const items = await this.listCanonicalRemoteItems(folderId, parentPath);
       for (const item of items) {
+        this.throwIfStopped();
         const path = parentPath ? `${parentPath}/${item.name}` : item.name;
         if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
           continue;
@@ -1233,6 +1284,7 @@ Continue only if this matches what you expect.`;
   }
   async handleLocalDeletions(localPathSet) {
     this.updateStatus("Checking for deletions...");
+    this.throwIfStopped();
     const stateEntries = Object.entries(this.stateManager.state);
     const locallyDeletedPaths = /* @__PURE__ */ new Set();
     const deletionCandidates = [];
@@ -1267,6 +1319,7 @@ Continue only if this matches what you expect.`;
       new import_obsidian5.Notice(`Confirmed large push deletion batch: deleting ${deletionCandidates.length} remote files.`);
     }
     for (const [path, entry] of deletionCandidates) {
+      this.throwIfStopped();
       try {
         this.updateStatus(`Deleting remote: ${path}`);
         await this.client.deleteFile(entry.driveId);
@@ -1317,6 +1370,7 @@ Continue only if this matches what you expect.`;
       new import_obsidian5.Notice(`Confirmed large pull deletion batch: deleting ${deletionCandidates.length} local files.`);
     }
     for (const [path, entry] of deletionCandidates) {
+      this.throwIfStopped();
       try {
         if (await this.app.vault.adapter.exists(path)) {
           this.updateStatus(`Deleting local: ${path}`);
@@ -1354,6 +1408,7 @@ Continue only if this matches what you expect.`;
         this.stats.failed++;
         this.stats.errors.push({ path, message: this.getErrorMessage(e) });
       }
+      await this.afterWorkItem();
     }
   }
   async download(path, remoteFile) {
@@ -1756,6 +1811,7 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
 };
 
 // main.ts
+var STARTUP_PULL_DELAY_MS = 5e3;
 var BACKGROUND_SYNC_IDLE_DELAY_MS = 6e4;
 var ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1e3;
 var DEFAULT_ACCESS_TOKEN_TTL_MS = 55 * 60 * 1e3;
@@ -1772,6 +1828,7 @@ var DEFAULT_SETTINGS = {
   folderName: "",
   syncInterval: 15,
   syncOnStartup: true,
+  syncPaused: false,
   initialPullComplete: false,
   lastPluginVersion: ""
 };
@@ -1780,6 +1837,9 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     super(...arguments);
     this.isSyncing = false;
     this.lastLocalChangeAt = 0;
+    this.startupPullTimeoutId = null;
+    this.backgroundSyncIntervalId = null;
+    this.startupPullRanThisSession = false;
   }
   async onload() {
     await this.loadSettings();
@@ -1797,15 +1857,12 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     this.registerEvent(this.app.vault.on("delete", markLocalChange));
     this.registerEvent(this.app.vault.on("rename", markLocalChange));
     const pluginVersionChanged = this.settings.lastPluginVersion !== this.manifest.version;
+    let shouldScheduleStartupPull = false;
     if (this.settings.accessToken) {
       this.initializeClient();
       this.setupSyncEngine();
-      if ((this.settings.syncOnStartup || pluginVersionChanged) && this.settings.folderId) {
-        setTimeout(() => {
-          new import_obsidian8.Notice(pluginVersionChanged ? "Google Drive: Pulling changes after plugin update..." : "Google Drive: Pulling startup changes...");
-          this.startupPullSync();
-        }, 5e3);
-      } else if (pluginVersionChanged) {
+      shouldScheduleStartupPull = (this.settings.syncOnStartup || pluginVersionChanged) && !!this.settings.folderId;
+      if (!shouldScheduleStartupPull && pluginVersionChanged) {
         this.settings.lastPluginVersion = this.manifest.version;
         await this.saveSettings();
       }
@@ -1821,6 +1878,10 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.pushSync();
     });
     pushRibbonIconEl.addClass("gdrive-sync-ribbon-icon");
+    const stopRibbonIconEl = this.addRibbonIcon("pause", "Stop Tether auto sync", (evt) => {
+      this.stopAutomaticSync();
+    });
+    stopRibbonIconEl.addClass("gdrive-sync-ribbon-icon");
     this.addCommand({
       id: "sync-google-drive",
       name: "Run Tether Push Sync",
@@ -1837,13 +1898,25 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       callback: () => this.pushSync()
     });
     this.addCommand({
+      id: "stop-google-drive-auto-sync",
+      name: "Stop Tether Auto Sync",
+      callback: () => this.stopAutomaticSync()
+    });
+    this.addCommand({
+      id: "resume-google-drive-auto-sync",
+      name: "Resume Tether Auto Sync",
+      callback: () => this.resumeAutomaticSync()
+    });
+    this.addCommand({
       id: "open-gdrive-sync-status",
       name: "Open Sync Status Sidebar",
       callback: () => this.activateView()
     });
     this.addSettingTab(new GoogleDriveSyncSettingTab(this.app, this));
-    if (this.settings.syncInterval > 0) {
-      this.registerInterval(window.setInterval(() => this.backgroundSync(), this.settings.syncInterval * 60 * 1e3));
+    if (shouldScheduleStartupPull) {
+      this.scheduleStartupPullSync(pluginVersionChanged);
+    } else {
+      this.scheduleBackgroundSync();
     }
     console.log("Google Drive Sync plugin loaded");
   }
@@ -1862,6 +1935,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     workspace.revealLeaf(leaf);
   }
   async onunload() {
+    this.clearAutomaticSyncTimers();
     console.log("Google Drive Sync plugin unloaded");
   }
   async loadSettings() {
@@ -1889,6 +1963,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   }
   async saveSettings() {
     var _a, _b, _c, _d;
+    const hadStartupPullPending = this.startupPullTimeoutId !== null;
     const oldFolderId = (_a = await this.loadData()) == null ? void 0 : _a.folderId;
     const folderChanged = !!this.settings.folderId && this.settings.folderId !== oldFolderId;
     if (folderChanged) {
@@ -1907,6 +1982,8 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.initializeClient();
       this.setupSyncEngine();
     }
+    const shouldKeepStartupPullPending = hadStartupPullPending && (this.settings.syncOnStartup || this.settings.lastPluginVersion !== this.manifest.version);
+    this.refreshAutomaticSyncTimers(shouldKeepStartupPullPending);
   }
   applyTokenResponse(tokens) {
     this.settings.accessToken = tokens.access_token;
@@ -1983,6 +2060,30 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   async pushSync() {
     await this.runSync("push");
   }
+  async stopAutomaticSync() {
+    const wasSyncing = this.isSyncing;
+    this.settings.syncPaused = true;
+    this.clearAutomaticSyncTimers();
+    if (this.syncEngine && wasSyncing) {
+      this.syncEngine.requestStop();
+    }
+    await this.saveSettings();
+    if (this.syncEngine && !wasSyncing) {
+      this.syncEngine.updateStatus("Auto sync stopped", { currentFile: "" }, true);
+    }
+    this.refreshStatusViews();
+    new import_obsidian8.Notice(wasSyncing ? "Tether auto sync stopped. Current sync is stopping..." : "Tether auto sync stopped.");
+  }
+  async resumeAutomaticSync() {
+    this.settings.syncPaused = false;
+    await this.saveSettings();
+    if (this.syncEngine && !this.isSyncing) {
+      this.syncEngine.updateStatus("Idle", { currentFile: "" }, true);
+    }
+    this.refreshAutomaticSyncTimers(this.settings.syncOnStartup && !this.startupPullRanThisSession);
+    this.refreshStatusViews();
+    new import_obsidian8.Notice("Tether auto sync resumed.");
+  }
   async runSync(mode, options = {}) {
     var _a, _b;
     if (this.isSyncing) {
@@ -2024,27 +2125,94 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
         await this.saveSettings();
       }
     } catch (error) {
-      console.error(`${mode} failed`, error);
-      if (isSessionExpiredError(error)) {
+      if (error instanceof SyncStoppedError) {
+        this.syncEngine.updateStatus("Stopped", { currentFile: "" }, true);
+        if (!options.silent) {
+          new import_obsidian8.Notice("Sync stopped.");
+        }
+      } else if (isSessionExpiredError(error)) {
         await this.handleExpiredSession(true);
       } else if (!options.silent) {
+        console.error(`${mode} failed`, error);
         new import_obsidian8.Notice(`${mode === "pull" ? "Pull" : "Push"} failed: ${error instanceof Error ? error.message : String(error)}`);
+      } else {
+        console.error(`${mode} failed`, error);
       }
     } finally {
       this.isSyncing = false;
     }
   }
   async startupPullSync() {
-    if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
+    if (this.settings.syncPaused || this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
       return;
+    this.startupPullRanThisSession = true;
     await this.runSync("pull", { revealStatus: false, showStartNotice: false });
   }
   async backgroundSync() {
-    if (this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
+    if (this.settings.syncPaused || this.isSyncing || !this.settings.accessToken || !this.settings.folderId)
       return;
     if (Date.now() - this.lastLocalChangeAt < BACKGROUND_SYNC_IDLE_DELAY_MS)
       return;
     await this.runSync("push", { silent: true, revealStatus: false });
+  }
+  scheduleStartupPullSync(pluginVersionChanged = false) {
+    this.clearStartupPullTimeout();
+    this.clearBackgroundSyncInterval();
+    if (this.settings.syncPaused || !this.settings.accessToken || !this.settings.folderId)
+      return;
+    this.startupPullTimeoutId = window.setTimeout(async () => {
+      this.startupPullTimeoutId = null;
+      if (this.settings.syncPaused)
+        return;
+      new import_obsidian8.Notice(pluginVersionChanged ? "Google Drive: Pulling changes after plugin update..." : "Google Drive: Pulling startup changes...");
+      try {
+        await this.startupPullSync();
+      } finally {
+        this.scheduleBackgroundSync();
+      }
+    }, STARTUP_PULL_DELAY_MS);
+  }
+  scheduleBackgroundSync() {
+    this.clearBackgroundSyncInterval();
+    if (this.settings.syncPaused || !this.settings.accessToken || !this.settings.folderId || this.settings.syncInterval <= 0)
+      return;
+    this.backgroundSyncIntervalId = window.setInterval(() => this.backgroundSync(), this.settings.syncInterval * 60 * 1e3);
+    this.registerInterval(this.backgroundSyncIntervalId);
+  }
+  refreshAutomaticSyncTimers(runStartupPull = false) {
+    if (!this.statusBarItem)
+      return;
+    this.clearAutomaticSyncTimers();
+    if (runStartupPull) {
+      this.scheduleStartupPullSync(this.settings.lastPluginVersion !== this.manifest.version);
+    } else {
+      this.scheduleBackgroundSync();
+    }
+  }
+  clearAutomaticSyncTimers() {
+    this.clearStartupPullTimeout();
+    this.clearBackgroundSyncInterval();
+  }
+  clearStartupPullTimeout() {
+    if (this.startupPullTimeoutId !== null) {
+      window.clearTimeout(this.startupPullTimeoutId);
+      this.startupPullTimeoutId = null;
+    }
+  }
+  clearBackgroundSyncInterval() {
+    if (this.backgroundSyncIntervalId !== null) {
+      window.clearInterval(this.backgroundSyncIntervalId);
+      this.backgroundSyncIntervalId = null;
+    }
+  }
+  refreshStatusViews() {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_SYNC_STATUS);
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (typeof view.render === "function") {
+        view.render();
+      }
+    }
   }
   async startLogin() {
     if (!this.settings.clientId || !this.settings.clientSecret) {
@@ -2206,7 +2374,14 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       this.plugin.settings.syncInterval = parseInt(value) || 0;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc("Startup pulls Drive changes. The timer and manual sync push local changes.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync()));
+    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc("Startup pulls Drive changes. The timer and manual sync push local changes.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync())).addButton((btn) => btn.setButtonText(this.plugin.settings.syncPaused ? "Resume Auto Sync" : "Stop Auto Sync").onClick(async () => {
+      if (this.plugin.settings.syncPaused) {
+        await this.plugin.resumeAutomaticSync();
+      } else {
+        await this.plugin.stopAutomaticSync();
+      }
+      this.display();
+    }));
   }
 };
 module.exports = __toCommonJS(main_exports);
