@@ -1,17 +1,21 @@
 import { App, Notice } from 'obsidian';
 import type { Stat } from 'obsidian';
-import { GoogleDriveClient, DriveFile, isSessionExpiredError } from './gdrive';
+import { GoogleDriveClient, DriveFile, GoogleDriveApiError, isSessionExpiredError } from './gdrive';
 import { StateManager } from './state';
+import { syncDiagnostics } from './diagnostics';
 import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-view';
 
-const RECENT_LOCAL_EDIT_GRACE_MS = 5000;
+const RECENT_LOCAL_EDIT_GRACE_MS = 30000;
 const DRAWING_LOCAL_EDIT_GRACE_MS = 30000;
 const STATE_SAVE_CHANGE_LIMIT = 40;
 const STATE_SAVE_INTERVAL_MS = 10000;
 const MANUAL_STATUS_UPDATE_MS = 500;
 const BACKGROUND_STATUS_UPDATE_MS = 3000;
-const WORK_YIELD_ITEM_LIMIT = 25;
+const WORK_YIELD_ITEM_LIMIT = 15;
 const CATASTROPHIC_DELETE_RATIO = 0.8;
+const UPLOAD_PROGRESS_DETAIL_BYTES = 256 * 1024;
+const PUSH_PARALLELISM = 3;
+const LARGE_UPLOAD_BYTES = 2 * 1024 * 1024;
 
 export type SyncMode = 'pull' | 'push';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
@@ -42,12 +46,15 @@ export class SyncEngine {
 	private lastStatusUpdateAt = 0;
 	private processedSinceYield = 0;
 	private stopRequested = false;
+	private largeUploadTail: Promise<void> = Promise.resolve();
+	private completedPushItems = 0;
 	
 	public stats: SyncStats = {
 		totalFiles: 0,
 		processed: 0,
 		failed: 0,
 		currentFile: '',
+		detail: '',
 		status: 'Idle',
 		lastSync: '',
 		errors: [],
@@ -111,10 +118,12 @@ export class SyncEngine {
 			this.stats.errors = [];
 			this.stats.conflicts = [];
 			this.stats.deferred = [];
+			this.stats.detail = '';
 			this.folderCache.clear();
 			this.remoteFolderCache.clear();
 			const mode = options.mode ?? 'push';
 			const modeLabel = mode === 'pull' ? 'Pull' : 'Push';
+			syncDiagnostics.startSession(mode);
 			
 			this.updateStatus('Loading state...', undefined, true);
 			await this.stateManager.load();
@@ -134,8 +143,10 @@ export class SyncEngine {
 
 			this.stats.lastSync = new Date().toLocaleTimeString();
 			this.stats.currentFile = '';
+			this.stats.detail = '';
 			await this.flushStateIfNeeded(true);
 			this.updateStatus('Idle', undefined, true);
+			syncDiagnostics.endSession('completed', this.stats);
 			
 			if (!this.silent && this.stats.failed > 0) {
 				new Notice(`${modeLabel} complete with ${this.stats.failed} errors. Check sidebar.`);
@@ -147,10 +158,18 @@ export class SyncEngine {
 		} catch (error) {
 			if (error instanceof SyncStoppedError) {
 				this.updateStatus('Stopped', { currentFile: '' }, true);
+				syncDiagnostics.endSession('stopped', this.stats);
 				throw error;
 			}
 
 			this.updateStatus('Failed', undefined, true);
+			syncDiagnostics.error(
+				error instanceof Error ? error.message : String(error),
+				this.stats.currentFile || undefined,
+				error instanceof GoogleDriveApiError ? error.status : undefined,
+				error instanceof GoogleDriveApiError ? error.reason : undefined
+			);
+			syncDiagnostics.endSession('failed', this.stats);
 			console.error('Critical sync failure', error);
 			throw error;
 		} finally {
@@ -187,40 +206,146 @@ export class SyncEngine {
 		await this.handleLocalDeletions(localPathSet);
 		this.throwIfStopped();
 
-		this.updateStatus('Pushing changes...');
-		for (const path of localPathSet) {
-			this.throwIfStopped();
-			this.stats.processed++;
-			this.stats.currentFile = path;
-			if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
-				this.updateStatus(`Pushing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ''}`);
-			}
-			
-			try {
-				await this.processLocalPath(path, vaultRootDriveId);
-			} catch (e) {
-				if (isSessionExpiredError(e)) throw e;
-				console.error(`Failed to push ${path}`, e);
-				if (this.isNotFound(e)) {
-					this.stateManager.remove(path);
-				} else {
-					this.stats.failed++;
-					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+		this.updateStatus('Pushing changes...', undefined, true);
+		this.completedPushItems = 0;
+		const paths = Array.from(localPathSet);
+		let nextIndex = 0;
+
+		const worker = async () => {
+			while (true) {
+				this.throwIfStopped();
+				const index = nextIndex++;
+				if (index >= paths.length) return;
+
+				const path = paths[index];
+				this.stats.currentFile = path;
+				this.reportPushProgress('Checking');
+
+				try {
+					await this.processLocalPath(path, vaultRootDriveId);
+				} catch (e) {
+					if (isSessionExpiredError(e) || e instanceof SyncStoppedError) throw e;
+					console.error(`Failed to push ${path}`, e);
+					const message = this.getErrorMessage(e);
+					syncDiagnostics.error(
+						message,
+						path,
+						e instanceof GoogleDriveApiError ? e.status : undefined,
+						e instanceof GoogleDriveApiError ? e.reason : undefined
+					);
+					if (this.isNotFound(e)) {
+						this.stateManager.remove(path);
+					} else {
+						this.stats.failed++;
+						this.stats.errors.push({ path, message });
+					}
 				}
+
+				this.completedPushItems++;
+				this.stats.processed = this.completedPushItems;
+				this.stats.detail = '';
+				this.reportPushProgress();
+				await this.afterWorkItem();
 			}
-			this.updateStatus(this.stats.status);
-			await this.afterWorkItem();
+		};
+
+		const workers = Array.from(
+			{ length: Math.min(PUSH_PARALLELISM, Math.max(1, paths.length)) },
+			() => worker()
+		);
+
+		const results = await Promise.allSettled(workers);
+		for (const result of results) {
+			if (result.status === 'rejected') {
+				throw result.reason;
+			}
 		}
+	}
+
+	private async withLargeUploadGate<T>(size: number, fn: () => Promise<T>): Promise<T> {
+		if (size < LARGE_UPLOAD_BYTES) {
+			return fn();
+		}
+
+		const previous = this.largeUploadTail;
+		let release!: () => void;
+		this.largeUploadTail = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await fn();
+		} finally {
+			release();
+		}
+	}
+
+	private reportPushProgress(detailPrefix?: string, force = false) {
+		const failedSuffix = this.stats.failed ? ` (${this.stats.failed} failed)` : '';
+		const status = `Pushing ${this.stats.processed}/${this.stats.totalFiles}${failedSuffix}`;
+		const fileName = this.stats.currentFile.split('/').pop() || this.stats.currentFile;
+		const detail = detailPrefix
+			? (this.stats.currentFile ? `${detailPrefix}: ${fileName}` : detailPrefix)
+			: this.stats.detail;
+		this.updateStatus(status, { currentFile: this.stats.currentFile, detail }, force);
+	}
+
+	private formatBytes(bytes: number): string {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+		return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+	}
+
+	private createUploadProgressHandler(path: string) {
+		const fileName = path.split('/').pop() || path;
+		return (uploadedBytes: number, totalBytes: number) => {
+			const pct = totalBytes > 0 ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 0;
+			const detail = totalBytes > UPLOAD_PROGRESS_DETAIL_BYTES
+				? `Uploading ${fileName}: ${this.formatBytes(uploadedBytes)} / ${this.formatBytes(totalBytes)} (${pct}%)`
+				: `Uploading ${fileName}: ${this.formatBytes(totalBytes)}`;
+			this.stats.detail = detail;
+			const failedSuffix = this.stats.failed ? ` (${this.stats.failed} failed)` : '';
+			const shortName = fileName.length > 24 ? `${fileName.slice(0, 21)}...` : fileName;
+			const status = totalBytes > UPLOAD_PROGRESS_DETAIL_BYTES
+				? `Pushing ${this.stats.processed}/${this.stats.totalFiles} · ${shortName} ${pct}%${failedSuffix}`
+				: `Pushing ${this.stats.processed}/${this.stats.totalFiles} · ${shortName}${failedSuffix}`;
+			this.updateStatus(status, { currentFile: path, detail }, true);
+		};
 	}
 
 	private isExcluded(path: string): boolean {
 		const statePath = this.stateManager.getStatePath();
-		return path.startsWith('.git/') || 
-			   path === '.git' || 
-			   path.startsWith('.trash/') ||
-			   path === '.trash' ||
-			   path === statePath ||
-			   path.includes('/.git/');
+		const segments = path.split('/');
+		const excludedRoots = new Set([
+			'.git',
+			'.trash',
+			'node_modules',
+			'.venv',
+			'venv',
+			'__pycache__',
+			'.next',
+			'dist',
+			'build',
+			'target',
+			'.cache',
+			'.turbo',
+			'.parcel-cache',
+			'coverage',
+			'.pytest_cache',
+			'.mypy_cache',
+			'.tox',
+			'.idea',
+			'.vscode',
+		]);
+
+		if (path === statePath || path.startsWith(`${statePath}/`)) return true;
+
+		for (const segment of segments) {
+			if (excludedRoots.has(segment)) return true;
+		}
+
+		return false;
 	}
 
 	private isConfigPath(path: string): boolean {
@@ -286,6 +411,26 @@ export class SyncEngine {
 		return status === 404 || this.getErrorMessage(error).includes('404');
 	}
 
+	private isENOENT(error: unknown): boolean {
+		const message = this.getErrorMessage(error).toLowerCase();
+		const code = typeof error === 'object' && error !== null && 'code' in error
+			? String((error as { code?: string }).code).toLowerCase()
+			: '';
+		return code === 'enoent' || message.includes('enoent');
+	}
+
+	private async safeStat(path: string): Promise<Stat | null> {
+		try {
+			return await this.app.vault.adapter.stat(path);
+		} catch (error) {
+			if (this.isENOENT(error)) {
+				syncDiagnostics.warn(`Skipped missing path during sync: ${path}`, path);
+				return null;
+			}
+			throw error;
+		}
+	}
+
 	private shouldProceedWithLargeDeletion(mode: SyncMode, count: number, trackedCount: number): boolean {
 		const percent = Math.round((count / trackedCount) * 100);
 		const target = mode === 'pull' ? 'local' : 'remote';
@@ -312,7 +457,16 @@ export class SyncEngine {
 
 	private async collectLocalPathSet(folderPath: string, items: Set<string> = new Set()): Promise<Set<string>> {
 		this.throwIfStopped();
-		const result = await this.app.vault.adapter.list(folderPath);
+		let result;
+		try {
+			result = await this.app.vault.adapter.list(folderPath);
+		} catch (error) {
+			if (this.isENOENT(error)) {
+				syncDiagnostics.warn(`Skipped missing folder during scan: ${folderPath}`, folderPath);
+				return items;
+			}
+			throw error;
+		}
 		
 		for (const file of result.files) {
 			this.throwIfStopped();
@@ -334,7 +488,7 @@ export class SyncEngine {
 	}
 
 	private async processLocalPath(path: string, vaultRootId: string) {
-		const stat = await this.app.vault.adapter.stat(path);
+		const stat = await this.safeStat(path);
 		if (!stat) return;
 
 		if (stat.type === 'folder') {
@@ -347,11 +501,45 @@ export class SyncEngine {
 		}
 
 		let state = this.stateManager.get(path);
+		if (state && stat.mtime <= state.lastSyncedMtime) {
+			return;
+		}
 		const extension = path.includes('.') ? path.split('.').pop() || '' : '';
 		const mimeType = this.getMimeType(extension);
 		const fileName = path.split('/').pop() || path;
 		const parentPath = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
 		const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
+
+		// Known Drive ID: update directly (no folder listing). Saves a lot of API + RAM on large vaults.
+		if (state?.driveId && stat.mtime > state.lastSyncedMtime) {
+			let updated = false;
+			await this.withLargeUploadGate(stat.size, async () => {
+				const upload = await this.readStableLocalFile(path, stat);
+				if (!upload) {
+					updated = true;
+					return;
+				}
+				try {
+					const onProgress = this.createUploadProgressHandler(path);
+					const remoteFile = await this.client.updateFile(state!.driveId, upload.content, mimeType, onProgress);
+					this.updateCachedRemoteFile(driveParentId, remoteFile);
+					this.stateManager.set(path, {
+						...state!,
+						lastSyncedMtime: upload.stat.mtime,
+						remoteMtime: remoteFile.modifiedTime
+					});
+					await this.deferIfChangedAfterUpload(path, upload.stat);
+					await this.flushStateIfNeeded();
+					updated = true;
+				} catch (e) {
+					if (!this.isNotFound(e)) throw e;
+					this.stateManager.remove(path);
+					state = undefined;
+				}
+			});
+			if (updated) return;
+		}
+
 		const existingRemote = await this.findRemoteFileByName(driveParentId, parentPath, fileName);
 
 		if (state && existingRemote && state.driveId !== existingRemote.id) {
@@ -361,34 +549,40 @@ export class SyncEngine {
 		}
 
 		if (!state) {
-			const upload = await this.readStableLocalFile(path, stat);
-			if (!upload) return;
-			const remoteFile = existingRemote
-				? await this.client.updateFile(existingRemote.id, upload.content, mimeType)
-				: await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
-			this.updateCachedRemoteFile(driveParentId, remoteFile);
-			
-			this.stateManager.set(path, {
-				driveId: remoteFile.id,
-				lastSyncedMtime: upload.stat.mtime,
-				remoteMtime: remoteFile.modifiedTime,
-				etag: ''
+			await this.withLargeUploadGate(stat.size, async () => {
+				const upload = await this.readStableLocalFile(path, stat);
+				if (!upload) return;
+				const onProgress = this.createUploadProgressHandler(path);
+				const remoteFile = existingRemote
+					? await this.client.updateFile(existingRemote.id, upload.content, mimeType, onProgress)
+					: await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType, onProgress);
+				this.updateCachedRemoteFile(driveParentId, remoteFile);
+
+				this.stateManager.set(path, {
+					driveId: remoteFile.id,
+					lastSyncedMtime: upload.stat.mtime,
+					remoteMtime: remoteFile.modifiedTime,
+					etag: ''
+				});
+				await this.deferIfChangedAfterUpload(path, upload.stat);
+				await this.flushStateIfNeeded();
 			});
-			await this.deferIfChangedAfterUpload(path, upload.stat);
-			await this.flushStateIfNeeded();
 		} else if (stat.mtime > state.lastSyncedMtime) {
-			const upload = await this.readStableLocalFile(path, stat);
-			if (!upload) return;
-			const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
-			this.updateCachedRemoteFile(driveParentId, remoteFile);
-			
-			this.stateManager.set(path, {
-				...state,
-				lastSyncedMtime: upload.stat.mtime,
-				remoteMtime: remoteFile.modifiedTime
+			await this.withLargeUploadGate(stat.size, async () => {
+				const upload = await this.readStableLocalFile(path, stat);
+				if (!upload) return;
+				const onProgress = this.createUploadProgressHandler(path);
+				const remoteFile = await this.client.updateFile(state!.driveId, upload.content, mimeType, onProgress);
+				this.updateCachedRemoteFile(driveParentId, remoteFile);
+
+				this.stateManager.set(path, {
+					...state!,
+					lastSyncedMtime: upload.stat.mtime,
+					remoteMtime: remoteFile.modifiedTime
+				});
+				await this.deferIfChangedAfterUpload(path, upload.stat);
+				await this.flushStateIfNeeded();
 			});
-			await this.deferIfChangedAfterUpload(path, upload.stat);
-			await this.flushStateIfNeeded();
 		}
 	}
 
@@ -408,8 +602,10 @@ export class SyncEngine {
 		
 		const parentDriveId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
 		
-		const existingFolders = await this.client.listFolders(parentDriveId);
-		const existing = existingFolders.find(f => f.name.toLowerCase() === folderName.toLowerCase());
+		const existingItems = await this.listCanonicalRemoteItems(parentDriveId, parentPath);
+		const existing = existingItems.find(
+			f => f.mimeType === GOOGLE_FOLDER_MIME_TYPE && f.name.toLowerCase() === folderName.toLowerCase()
+		);
 		
 		if (existing) {
 			this.stateManager.set(path, {
@@ -594,11 +790,18 @@ export class SyncEngine {
 				} catch (e) {
 					if (isSessionExpiredError(e)) throw e;
 					console.error(`Failed to pull ${path}`, e);
+					const message = this.getErrorMessage(e);
+					syncDiagnostics.error(
+						message,
+						path,
+						e instanceof GoogleDriveApiError ? e.status : undefined,
+						e instanceof GoogleDriveApiError ? e.reason : undefined
+					);
 					if (this.isNotFound(e)) {
 						this.stateManager.remove(path);
 					} else {
 						this.stats.failed++;
-						this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+						this.stats.errors.push({ path, message });
 					}
 				}
 
@@ -719,7 +922,7 @@ export class SyncEngine {
 		}
 
 		const existsLocal = await this.app.vault.adapter.exists(path);
-		const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
+		const localStat = existsLocal ? await this.safeStat(path) : null;
 
 		if (localStat?.type === 'file' && await this.shouldDeferActiveLocalFile(path, localStat)) {
 			return;
@@ -887,7 +1090,7 @@ export class SyncEngine {
 			try {
 				if (await this.app.vault.adapter.exists(path)) {
 					this.updateStatus(`Deleting local: ${path}`);
-					const stat = await this.app.vault.adapter.stat(path);
+					const stat = await this.safeStat(path);
 					if (stat?.type === 'file' && this.isOpenFilePath(path)) {
 						this.addDeferredFile(path, 'open in Obsidian');
 						continue;
@@ -943,7 +1146,7 @@ export class SyncEngine {
 		}
 
 		await this.app.vault.adapter.writeBinary(path, content);
-		const stat = await this.app.vault.adapter.stat(path);
+		const stat = await this.safeStat(path);
 		
 		this.stateManager.set(path, {
 			driveId: remoteFile.id,
@@ -976,7 +1179,7 @@ export class SyncEngine {
 		const descendants = await this.listAllLocalItems(folderPath);
 
 		for (const path of descendants) {
-			const stat = await this.app.vault.adapter.stat(path);
+			const stat = await this.safeStat(path);
 			if (!stat || stat.type !== 'file') continue;
 
 			const state = this.stateManager.get(path);
@@ -990,18 +1193,14 @@ export class SyncEngine {
 	}
 
 	private async shouldDeferActiveLocalFile(path: string, stat?: Stat | null): Promise<boolean> {
-		const localStat = stat ?? await this.app.vault.adapter.stat(path);
+		const localStat = stat ?? await this.safeStat(path);
 		if (!localStat || localStat.type !== 'file') return false;
-
-		if (this.isOpenFilePath(path)) {
-			this.addDeferredFile(path, 'open in Obsidian');
-			return true;
-		}
 
 		const graceMs = this.getLocalEditGraceMs(path);
 		const ageMs = Date.now() - localStat.mtime;
 		if (ageMs < graceMs) {
-			this.addDeferredFile(path, 'recent local edit');
+			const reason = this.isOpenFilePath(path) ? 'open and recently edited' : 'recent local edit';
+			this.addDeferredFile(path, reason);
 			return true;
 		}
 
@@ -1009,8 +1208,18 @@ export class SyncEngine {
 	}
 
 	private async readStableLocalFile(path: string, stat: Stat): Promise<{ content: ArrayBuffer, stat: Stat } | null> {
-		const content = await this.app.vault.adapter.readBinary(path);
-		const latestStat = await this.app.vault.adapter.stat(path);
+		let content: ArrayBuffer;
+		try {
+			content = await this.app.vault.adapter.readBinary(path);
+		} catch (error) {
+			if (this.isENOENT(error)) {
+				syncDiagnostics.warn(`Skipped missing file during read: ${path}`, path);
+				return null;
+			}
+			throw error;
+		}
+
+		const latestStat = await this.safeStat(path);
 
 		if (!latestStat || latestStat.type !== 'file') {
 			this.addDeferredFile(path, 'changed while syncing');
@@ -1026,7 +1235,7 @@ export class SyncEngine {
 	}
 
 	private async deferIfChangedAfterUpload(path: string, syncedStat: Stat) {
-		const latestStat = await this.app.vault.adapter.stat(path);
+		const latestStat = await this.safeStat(path);
 		if (!latestStat || latestStat.type !== 'file') return;
 
 		if (latestStat.mtime !== syncedStat.mtime || latestStat.size !== syncedStat.size) {

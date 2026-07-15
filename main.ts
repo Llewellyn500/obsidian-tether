@@ -598,6 +598,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 class GoogleDriveSyncSettingTab extends PluginSettingTab {
 	plugin: GoogleDriveSyncPlugin;
 	authCode: string = '';
+	private showCredentials = false;
 
 	constructor(app: App, plugin: GoogleDriveSyncPlugin) {
 		super(app, plugin);
@@ -625,8 +626,48 @@ class GoogleDriveSyncSettingTab extends PluginSettingTab {
 					.onClick(() => {
 						this.plugin.settings.clientId = '';
 						this.plugin.settings.clientSecret = '';
+						this.showCredentials = false;
 						this.display();
 					}));
+			new Setting(step1)
+				.setName('Another vault setup')
+				.setDesc('Show your saved Client ID and Secret to paste into Tether on another vault or device.')
+				.addButton(btn => btn
+					.setButtonText(this.showCredentials ? 'Hide credentials' : 'Show credentials')
+					.onClick(() => {
+						this.showCredentials = !this.showCredentials;
+						this.display();
+					}));
+			if (this.showCredentials) {
+				new Setting(step1)
+					.setName('Client ID')
+					.addText(text => text
+						.setValue(this.plugin.settings.clientId)
+						.setDisabled(true));
+				new Setting(step1)
+					.setName('Client Secret')
+					.addText(text => text
+						.setValue(this.plugin.settings.clientSecret)
+						.setDisabled(true));
+				new Setting(step1)
+					.setName('Copy credentials')
+					.setDesc('Copy both values to paste into another vault\'s Tether settings.')
+					.addButton(btn => btn
+						.setButtonText('Copy')
+						.onClick(async () => {
+							const text = [
+								`Client ID: ${this.plugin.settings.clientId}`,
+								`Client Secret: ${this.plugin.settings.clientSecret}`,
+							].join('\n');
+							try {
+								await navigator.clipboard.writeText(text);
+								new Notice('Credentials copied to clipboard.');
+							} catch (e) {
+								console.error('Failed to copy credentials', e);
+								new Notice('Failed to copy credentials.');
+							}
+						}));
+			}
 		} else {
 			new Setting(step1)
 				.setName('Setup Guide')

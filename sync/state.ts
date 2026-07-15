@@ -36,7 +36,7 @@ export class StateManager {
 	async save() {
 		if (!this.dirty) return;
 
-		await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state, null, 2));
+		await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state));
 		this.dirty = false;
 		this.pendingChanges = 0;
 		this.lastSavedAt = Date.now();

@@ -95,7 +95,7 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - If a startup/manual pull or manual push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
 - Tether checks each Drive folder for duplicate same-name files, folds differing duplicate content into the chosen file's Drive revision history, then removes the extra Drive files.
-- Tether excludes `.git`, `.trash`, and its own sync state file at `.obsidian/gdrive-sync.json`.
+- Tether excludes `.git`, `.trash`, `node_modules`, `.venv` / `venv`, `__pycache__`, common build folders (`.next`, `dist`, `build`, `target`), and its own sync state file at `.obsidian/gdrive-sync.json`.
 
 ## Compatibility
 

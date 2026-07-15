@@ -57,7 +57,7 @@ var StateManager = class {
   async save() {
     if (!this.dirty)
       return;
-    await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state, null, 2));
+    await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state));
     this.dirty = false;
     this.pendingChanges = 0;
     this.lastSavedAt = Date.now();
@@ -213,11 +213,104 @@ var OAuthManager = class {
   }
 };
 
+// sync/diagnostics.ts
+var MAX_EVENTS = 200;
+var SyncDiagnostics = class {
+  constructor() {
+    this.events = [];
+    this.currentMode = "";
+  }
+  startSession(mode) {
+    this.currentMode = mode;
+    this.info(`Sync session started (${mode})`);
+  }
+  endSession(status, stats) {
+    var _a, _b, _c;
+    const summary = stats ? `${status}: ${(_a = stats.processed) != null ? _a : 0}/${(_b = stats.totalFiles) != null ? _b : 0} processed, ${(_c = stats.failed) != null ? _c : 0} failed` : status;
+    this.info(`Sync session ended (${summary})`);
+    this.currentMode = "";
+  }
+  info(message, path) {
+    this.add("info", message, path);
+  }
+  warn(message, path, status, reason) {
+    this.add("warn", message, path, status, reason);
+  }
+  error(message, path, status, reason) {
+    this.add("error", message, path, status, reason);
+  }
+  getEvents() {
+    return [...this.events];
+  }
+  formatReport(pluginVersion, stats) {
+    const lines = [
+      "Tether Sync Diagnostics",
+      "=======================",
+      `Generated: ${new Date().toISOString()}`,
+      `Plugin version: ${pluginVersion}`
+    ];
+    if (stats) {
+      lines.push(`Status: ${stats.status}`, `Progress: ${stats.processed}/${stats.totalFiles}`, `Failed: ${stats.failed}`, `Deferred: ${stats.deferred.length}`, `Last sync: ${stats.lastSync || "n/a"}`);
+      if (stats.currentFile) {
+        lines.push(`Current/last file: ${stats.currentFile}`);
+      }
+      if (stats.errors.length > 0) {
+        lines.push("", "Recent sync errors:");
+        for (const err of stats.errors.slice(-20)) {
+          lines.push(`  - ${err.path}: ${err.message}`);
+        }
+      }
+    }
+    lines.push("", "Event log:");
+    for (const event of this.events) {
+      const time = new Date(event.timestamp).toISOString();
+      const mode = event.mode ? ` [${event.mode}]` : "";
+      const path = event.path ? ` (${event.path})` : "";
+      const http = event.status ? ` HTTP ${event.status}` : "";
+      const reason = event.reason ? ` (${event.reason})` : "";
+      lines.push(`${time} ${event.level.toUpperCase()}${mode}${path}: ${event.message}${http}${reason}`);
+    }
+    return lines.join("\n");
+  }
+  add(level, message, path, status, reason) {
+    this.events.push({
+      timestamp: Date.now(),
+      level,
+      mode: this.currentMode || void 0,
+      path,
+      message: this.sanitize(message),
+      status,
+      reason
+    });
+    if (this.events.length > MAX_EVENTS) {
+      this.events.splice(0, this.events.length - MAX_EVENTS);
+    }
+  }
+  sanitize(message) {
+    return message.replace(/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi, "Bearer [redacted]").replace(/access_token[=:]\s*["']?[^"'\s]+/gi, "access_token=[redacted]").replace(/refresh_token[=:]\s*["']?[^"'\s]+/gi, "refresh_token=[redacted]").replace(/client_secret[=:]\s*["']?[^"'\s]+/gi, "client_secret=[redacted]");
+  }
+};
+var syncDiagnostics = new SyncDiagnostics();
+
 // sync/gdrive.ts
+var REQUEST_MIN_SPACING_MS = 35;
+var REQUEST_MAX_SPACING_MS = 250;
+var REQUEST_MAX_CONCURRENT = 3;
+var DEFAULT_REQUEST_TIMEOUT_MS = 3e4;
+var UPLOAD_REQUEST_TIMEOUT_MS = 12e4;
+var MAX_RETRIES = 6;
+var CHUNK_SIZE = 512 * 1024;
+var CHUNK_THRESHOLD = 256 * 1024;
 var SessionExpiredError = class extends Error {
   constructor(message = "Session expired. Please log in again.") {
     super(message);
     this.name = "SessionExpiredError";
+  }
+};
+var RequestTimeoutError = class extends Error {
+  constructor(message = "Google Drive request timed out.") {
+    super(message);
+    this.name = "RequestTimeoutError";
   }
 };
 var GoogleDriveApiError = class extends Error {
@@ -232,13 +325,106 @@ var GoogleDriveApiError = class extends Error {
 function isSessionExpiredError(error) {
   return error instanceof SessionExpiredError || error instanceof Error && error.name === "SessionExpiredError";
 }
+var RequestQueue = class {
+  constructor() {
+    this.active = 0;
+    this.pending = [];
+    this.lastRequestAt = 0;
+    this.spacingMs = REQUEST_MIN_SPACING_MS;
+    this.paceTail = Promise.resolve();
+  }
+  schedule(fn) {
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        this.active++;
+        void this.run(fn).then(resolve, reject).finally(() => {
+          this.active--;
+          this.pump();
+        });
+      };
+      this.pending.push(start);
+      this.pump();
+    });
+  }
+  pump() {
+    while (this.active < REQUEST_MAX_CONCURRENT && this.pending.length > 0) {
+      const next = this.pending.shift();
+      if (next)
+        next();
+    }
+  }
+  async run(fn) {
+    await this.pace();
+    return fn();
+  }
+  pace() {
+    this.paceTail = this.paceTail.then(async () => {
+      const elapsed = Date.now() - this.lastRequestAt;
+      const waitMs = Math.max(0, this.spacingMs - elapsed);
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+      this.lastRequestAt = Date.now();
+    });
+    return this.paceTail;
+  }
+  adaptAfterSuccess() {
+    this.spacingMs = Math.max(REQUEST_MIN_SPACING_MS, Math.floor(this.spacingMs * 0.9));
+  }
+  adaptAfterRateLimit() {
+    this.spacingMs = Math.min(REQUEST_MAX_SPACING_MS, Math.ceil(this.spacingMs * 1.75) + 20);
+  }
+};
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 var GoogleDriveClient = class {
   constructor(accessToken, onTokenRefresh, refreshParams) {
+    this.requestQueue = new RequestQueue();
     this.accessToken = accessToken;
     this.onTokenRefresh = onTokenRefresh;
     this.refreshParams = refreshParams;
   }
-  async request(options, retry = true) {
+  async request(options, retryAuth = true) {
+    return this.requestQueue.schedule(() => this.requestWithRetries(options, retryAuth));
+  }
+  async requestWithRetries(options, retryAuth) {
+    let attempt = 0;
+    while (true) {
+      try {
+        const response = await this.executeRequest(options, retryAuth);
+        this.requestQueue.adaptAfterSuccess();
+        return response;
+      } catch (error) {
+        if (error instanceof SessionExpiredError)
+          throw error;
+        if (error instanceof RequestTimeoutError) {
+          if (attempt < MAX_RETRIES) {
+            attempt++;
+            const delayMs = this.getRetryDelayMs(attempt);
+            syncDiagnostics.warn(`Request timed out, retrying in ${delayMs}ms`, void 0, void 0, "timeout");
+            await sleep(delayMs);
+            continue;
+          }
+          throw new GoogleDriveApiError(0, "Google Drive request timed out after multiple retries.", "timeout", "Check your network connection and try again.");
+        }
+        if (error instanceof GoogleDriveApiError && this.isRetryable(error.status, error.reason, error.message)) {
+          if (this.isRateLimitError(error.status, error.reason, error.message)) {
+            this.requestQueue.adaptAfterRateLimit();
+          }
+          if (attempt < MAX_RETRIES) {
+            attempt++;
+            const delayMs = this.getRetryDelayMs(attempt, error);
+            syncDiagnostics.warn(`Drive API retry ${attempt}/${MAX_RETRIES} in ${delayMs}ms: ${error.message}`, void 0, error.status, error.reason);
+            await sleep(delayMs);
+            continue;
+          }
+        }
+        throw error;
+      }
+    }
+  }
+  async executeRequest(options, retryAuth) {
     const requestOptions = {
       ...options,
       throw: false,
@@ -247,23 +433,42 @@ var GoogleDriveClient = class {
         "Authorization": `Bearer ${this.accessToken}`
       }
     };
+    const timeoutMs = this.getTimeoutForRequest(options);
     let response;
     try {
-      response = await (0, import_obsidian3.requestUrl)(requestOptions);
+      response = await this.requestWithTimeout(requestOptions, timeoutMs);
     } catch (error) {
+      if (error instanceof RequestTimeoutError)
+        throw error;
       const status = typeof error === "object" && error !== null && "status" in error ? error.status : void 0;
-      if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+      if (status === 401 && retryAuth && this.refreshParams && this.onTokenRefresh) {
         return await this.handleRefresh(options);
       }
       throw this.toApiError(error);
     }
-    if (response.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+    if (response.status === 401 && retryAuth && this.refreshParams && this.onTokenRefresh) {
       return await this.handleRefresh(options);
+    }
+    if (response.status === 308) {
+      return response;
     }
     if (response.status >= 400) {
       throw this.toApiError(response);
     }
     return response;
+  }
+  async requestWithTimeout(options, timeoutMs) {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = window.setTimeout(() => reject(new RequestTimeoutError()), timeoutMs);
+    });
+    try {
+      return await Promise.race([(0, import_obsidian3.requestUrl)(options), timeoutPromise]);
+    } finally {
+      if (timeoutId !== void 0) {
+        window.clearTimeout(timeoutId);
+      }
+    }
   }
   async handleRefresh(options) {
     await this.refreshAccessToken();
@@ -328,6 +533,12 @@ var GoogleDriveClient = class {
   getApiErrorHint(status, reason, message) {
     const normalizedReason = (reason || "").toLowerCase();
     const normalizedMessage = message.toLowerCase();
+    if (status === 429 || this.isRateLimitError(status, reason, message)) {
+      return "Google Drive rate limit reached. Tether will retry automatically; large vaults may take longer to finish.";
+    }
+    if (status === 0 && normalizedReason === "timeout") {
+      return "A Drive request timed out. Check your network connection and retry sync.";
+    }
     if (status === 403 && (normalizedReason.includes("accessnotconfigured") || normalizedMessage.includes("api has not been used") || normalizedMessage.includes("it is disabled"))) {
       return "Enable the Google Drive API in the same Google Cloud project used for this OAuth client, then wait a few minutes and try again.";
     }
@@ -338,6 +549,54 @@ var GoogleDriveClient = class {
       return "Check that the Drive API is enabled, the required Drive scopes are added, this Google account is allowed to test the app if it is still in Testing, and then log in to Tether again.";
     }
     return void 0;
+  }
+  isRateLimitError(status, reason, message) {
+    if (status === 429)
+      return true;
+    if (status !== 403)
+      return false;
+    const normalizedReason = (reason || "").toLowerCase();
+    const normalizedMessage = (message || "").toLowerCase();
+    return normalizedReason.includes("ratelimit") || normalizedReason.includes("userlimit") || normalizedReason.includes("sharingratelimit") || normalizedMessage.includes("rate limit") || normalizedMessage.includes("quota");
+  }
+  isRetryable(status, reason, message) {
+    return this.isRateLimitError(status, reason, message) || status >= 500;
+  }
+  getRetryDelayMs(attempt, error) {
+    if ((error == null ? void 0 : error.status) === 429 || this.isRateLimitError((error == null ? void 0 : error.status) || 0, error == null ? void 0 : error.reason, error == null ? void 0 : error.message)) {
+      return Math.min(3e4, 2e3 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+    }
+    return Math.min(6e4, 1e3 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+  }
+  getTimeoutForRequest(options) {
+    const method = (options.method || "GET").toUpperCase();
+    if (method === "PUT" || method === "POST" || method === "PATCH") {
+      return UPLOAD_REQUEST_TIMEOUT_MS;
+    }
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+  getContentLength(content) {
+    if (typeof content === "string") {
+      return new TextEncoder().encode(content).byteLength;
+    }
+    if (content instanceof Uint8Array) {
+      return content.byteLength;
+    }
+    return content.byteLength;
+  }
+  toByteArray(content) {
+    if (typeof content === "string") {
+      return new TextEncoder().encode(content);
+    }
+    return new Uint8Array(content);
+  }
+  toRequestBody(bytes) {
+    if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength && bytes.buffer instanceof ArrayBuffer) {
+      return bytes.buffer;
+    }
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return copy.buffer;
   }
   async listFiles(folderId) {
     let files = [];
@@ -410,58 +669,92 @@ var GoogleDriveClient = class {
     });
     return response.json;
   }
-  async uploadFile(name, folderId, content, mimeType = "text/markdown") {
+  async uploadFile(name, folderId, content, mimeType = "text/markdown", onProgress) {
     const metadata = {
       name,
       parents: [folderId],
       mimeType
     };
+    const contentLength = this.getContentLength(content);
     const initUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size";
     const initResponse = await this.request({
       url: initUrl,
       method: "POST",
       headers: {
         "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": mimeType
+        "X-Upload-Content-Type": mimeType,
+        "X-Upload-Content-Length": String(contentLength)
       },
       body: JSON.stringify(metadata)
     });
     const uploadUrl = initResponse.headers["location"] || initResponse.headers["Location"];
     if (!uploadUrl)
       throw new Error("Failed to get resumable upload URL");
-    const uploadResponse = await this.request({
-      url: uploadUrl,
-      method: "PUT",
-      headers: {
-        "Content-Type": mimeType
-      },
-      body: content
-    });
-    return uploadResponse.json;
+    return this.uploadResumableContent(uploadUrl, content, mimeType, onProgress);
   }
-  async updateFile(fileId, content, mimeType = "text/markdown") {
+  async updateFile(fileId, content, mimeType = "text/markdown", onProgress) {
+    const contentLength = this.getContentLength(content);
     const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size`;
     const initResponse = await this.request({
       url: initUrl,
       method: "PATCH",
       headers: {
         "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": mimeType
+        "X-Upload-Content-Type": mimeType,
+        "X-Upload-Content-Length": String(contentLength)
       },
       body: JSON.stringify({})
     });
     const uploadUrl = initResponse.headers["location"] || initResponse.headers["Location"];
     if (!uploadUrl)
       throw new Error("Failed to get resumable update URL");
-    const uploadResponse = await this.request({
-      url: uploadUrl,
-      method: "PUT",
-      headers: {
-        "Content-Type": mimeType
-      },
-      body: content
-    });
-    return uploadResponse.json;
+    return this.uploadResumableContent(uploadUrl, content, mimeType, onProgress);
+  }
+  async uploadResumableContent(uploadUrl, content, mimeType, onProgress) {
+    const total = this.getContentLength(content);
+    onProgress == null ? void 0 : onProgress(0, total);
+    if (total <= CHUNK_THRESHOLD) {
+      const body = typeof content === "string" ? this.toRequestBody(this.toByteArray(content)) : content;
+      const uploadResponse = await this.request({
+        url: uploadUrl,
+        method: "PUT",
+        headers: {
+          "Content-Type": mimeType
+        },
+        body
+      });
+      onProgress == null ? void 0 : onProgress(total, total);
+      return uploadResponse.json;
+    }
+    const bytes = this.toByteArray(content);
+    let offset = 0;
+    while (offset < total) {
+      const end = Math.min(offset + CHUNK_SIZE, total);
+      const chunk = bytes.subarray(offset, end);
+      const isLast = end === total;
+      const headers = {
+        "Content-Range": `bytes ${offset}-${end - 1}/${total}`
+      };
+      if (isLast) {
+        headers["Content-Type"] = mimeType;
+      }
+      onProgress == null ? void 0 : onProgress(offset, total);
+      const uploadResponse = await this.request({
+        url: uploadUrl,
+        method: "PUT",
+        headers,
+        body: this.toRequestBody(chunk)
+      });
+      offset = end;
+      onProgress == null ? void 0 : onProgress(offset, total);
+      if (isLast) {
+        return uploadResponse.json;
+      }
+      if (uploadResponse.status !== 308) {
+        throw new Error(`Unexpected resumable upload response: ${uploadResponse.status}`);
+      }
+    }
+    throw new Error("Resumable upload completed without final response.");
   }
   async getUserInfo() {
     const response = await this.request({
@@ -490,6 +783,7 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
       processed: 0,
       failed: 0,
       currentFile: "",
+      detail: "",
       status: "Idle",
       lastSync: "Never",
       errors: [],
@@ -524,6 +818,7 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
     container.addClass("gdrive-sync-view");
     container.createEl("h3", { text: "Sync Status" });
     this.createSyncActions(container);
+    this.createDiagnosticsActions(container);
     const statsGrid = container.createDiv({ cls: "sync-stats-grid" });
     this.createStat(statsGrid, "Status", this.stats.status);
     this.createStat(statsGrid, "Progress", `${this.stats.processed} / ${this.stats.totalFiles}`);
@@ -536,6 +831,16 @@ var SyncStatusView = class extends import_obsidian4.ItemView {
     }
     if (this.stats.currentFile) {
       container.createEl("p", { text: `Currently: ${this.stats.currentFile}`, cls: "current-file-text" });
+    }
+    if (this.stats.detail) {
+      container.createEl("p", { text: this.stats.detail, cls: "sync-detail-text" });
+    }
+    if (this.stats.totalFiles > 0 && this.stats.status !== "Idle") {
+      const pct = Math.min(100, Math.round(this.stats.processed / this.stats.totalFiles * 100));
+      const bar = container.createDiv({ cls: "sync-progress-bar" });
+      const fill = bar.createDiv({ cls: "sync-progress-fill" });
+      fill.style.width = `${pct}%`;
+      container.createEl("p", { text: `${pct}% of vault items checked`, cls: "sync-progress-label" });
     }
     if (this.stats.conflicts.length > 0) {
       container.createEl("h4", { text: "\u{1F6A9} Conflicts (Needs Review)" });
@@ -602,6 +907,36 @@ ${conflict.path}`)) {
     stat.createDiv({ text: label, cls: "stat-label" });
     stat.createDiv({ text: value, cls: "stat-value " + cls });
   }
+  createDiagnosticsActions(parent) {
+    const plugin = this.app.plugins.getPlugin("tether");
+    const actions = parent.createDiv({ cls: "sync-diag-row" });
+    const copyButton = actions.createEl("button", { text: "Copy diagnostics" });
+    copyButton.onClickEvent(async () => {
+      var _a, _b;
+      try {
+        const report = syncDiagnostics.formatReport(((_a = plugin == null ? void 0 : plugin.manifest) == null ? void 0 : _a.version) || "unknown", ((_b = plugin == null ? void 0 : plugin.syncEngine) == null ? void 0 : _b.stats) || this.stats);
+        await navigator.clipboard.writeText(report);
+        new import_obsidian4.Notice("Diagnostics copied to clipboard.");
+      } catch (e) {
+        console.error("Failed to copy diagnostics", e);
+        new import_obsidian4.Notice("Failed to copy diagnostics.");
+      }
+    });
+    const saveButton = actions.createEl("button", { text: "Save diagnostics" });
+    saveButton.onClickEvent(async () => {
+      var _a, _b;
+      try {
+        const report = syncDiagnostics.formatReport(((_a = plugin == null ? void 0 : plugin.manifest) == null ? void 0 : _a.version) || "unknown", ((_b = plugin == null ? void 0 : plugin.syncEngine) == null ? void 0 : _b.stats) || this.stats);
+        const configDir = this.app.vault.configDir || ".obsidian";
+        const path = (0, import_obsidian4.normalizePath)(`${configDir}/tether-diagnostics.txt`);
+        await this.app.vault.adapter.write(path, report);
+        new import_obsidian4.Notice("Diagnostics saved to .obsidian/tether-diagnostics.txt");
+      } catch (e) {
+        console.error("Failed to save diagnostics", e);
+        new import_obsidian4.Notice("Failed to save diagnostics.");
+      }
+    });
+  }
   createSyncActions(parent) {
     var _a, _b;
     const plugin = this.app.plugins.getPlugin("tether");
@@ -641,14 +976,17 @@ ${conflict.path}`)) {
 };
 
 // sync/engine.ts
-var RECENT_LOCAL_EDIT_GRACE_MS = 5e3;
+var RECENT_LOCAL_EDIT_GRACE_MS = 3e4;
 var DRAWING_LOCAL_EDIT_GRACE_MS = 3e4;
 var STATE_SAVE_CHANGE_LIMIT = 40;
 var STATE_SAVE_INTERVAL_MS = 1e4;
 var MANUAL_STATUS_UPDATE_MS = 500;
 var BACKGROUND_STATUS_UPDATE_MS = 3e3;
-var WORK_YIELD_ITEM_LIMIT = 25;
+var WORK_YIELD_ITEM_LIMIT = 15;
 var CATASTROPHIC_DELETE_RATIO = 0.8;
+var UPLOAD_PROGRESS_DETAIL_BYTES = 256 * 1024;
+var PUSH_PARALLELISM = 3;
+var LARGE_UPLOAD_BYTES = 2 * 1024 * 1024;
 var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 var SyncStoppedError = class extends Error {
   constructor() {
@@ -665,11 +1003,14 @@ var SyncEngine = class {
     this.lastStatusUpdateAt = 0;
     this.processedSinceYield = 0;
     this.stopRequested = false;
+    this.largeUploadTail = Promise.resolve();
+    this.completedPushItems = 0;
     this.stats = {
       totalFiles: 0,
       processed: 0,
       failed: 0,
       currentFile: "",
+      detail: "",
       status: "Idle",
       lastSync: "",
       errors: [],
@@ -721,10 +1062,12 @@ var SyncEngine = class {
       this.stats.errors = [];
       this.stats.conflicts = [];
       this.stats.deferred = [];
+      this.stats.detail = "";
       this.folderCache.clear();
       this.remoteFolderCache.clear();
       const mode = (_c = options.mode) != null ? _c : "push";
       const modeLabel = mode === "pull" ? "Pull" : "Push";
+      syncDiagnostics.startSession(mode);
       this.updateStatus("Loading state...", void 0, true);
       await this.stateManager.load();
       const vaultName = this.app.vault.getName();
@@ -739,8 +1082,10 @@ var SyncEngine = class {
       }
       this.stats.lastSync = new Date().toLocaleTimeString();
       this.stats.currentFile = "";
+      this.stats.detail = "";
       await this.flushStateIfNeeded(true);
       this.updateStatus("Idle", void 0, true);
+      syncDiagnostics.endSession("completed", this.stats);
       if (!this.silent && this.stats.failed > 0) {
         new import_obsidian5.Notice(`${modeLabel} complete with ${this.stats.failed} errors. Check sidebar.`);
       } else if (!this.silent && this.stats.deferred.length > 0) {
@@ -751,9 +1096,12 @@ var SyncEngine = class {
     } catch (error) {
       if (error instanceof SyncStoppedError) {
         this.updateStatus("Stopped", { currentFile: "" }, true);
+        syncDiagnostics.endSession("stopped", this.stats);
         throw error;
       }
       this.updateStatus("Failed", void 0, true);
+      syncDiagnostics.error(error instanceof Error ? error.message : String(error), this.stats.currentFile || void 0, error instanceof GoogleDriveApiError ? error.status : void 0, error instanceof GoogleDriveApiError ? error.reason : void 0);
+      syncDiagnostics.endSession("failed", this.stats);
       console.error("Critical sync failure", error);
       throw error;
     } finally {
@@ -784,34 +1132,124 @@ var SyncEngine = class {
     this.throwIfStopped();
     await this.handleLocalDeletions(localPathSet);
     this.throwIfStopped();
-    this.updateStatus("Pushing changes...");
-    for (const path of localPathSet) {
-      this.throwIfStopped();
-      this.stats.processed++;
-      this.stats.currentFile = path;
-      if (this.stats.processed % 10 === 0 || this.stats.processed === this.stats.totalFiles) {
-        this.updateStatus(`Pushing ${this.stats.processed}/${this.stats.totalFiles}${this.stats.failed ? ` (${this.stats.failed} failed)` : ""}`);
-      }
-      try {
-        await this.processLocalPath(path, vaultRootDriveId);
-      } catch (e) {
-        if (isSessionExpiredError(e))
-          throw e;
-        console.error(`Failed to push ${path}`, e);
-        if (this.isNotFound(e)) {
-          this.stateManager.remove(path);
-        } else {
-          this.stats.failed++;
-          this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+    this.updateStatus("Pushing changes...", void 0, true);
+    this.completedPushItems = 0;
+    const paths = Array.from(localPathSet);
+    let nextIndex = 0;
+    const worker = async () => {
+      while (true) {
+        this.throwIfStopped();
+        const index = nextIndex++;
+        if (index >= paths.length)
+          return;
+        const path = paths[index];
+        this.stats.currentFile = path;
+        this.reportPushProgress("Checking");
+        try {
+          await this.processLocalPath(path, vaultRootDriveId);
+        } catch (e) {
+          if (isSessionExpiredError(e) || e instanceof SyncStoppedError)
+            throw e;
+          console.error(`Failed to push ${path}`, e);
+          const message = this.getErrorMessage(e);
+          syncDiagnostics.error(message, path, e instanceof GoogleDriveApiError ? e.status : void 0, e instanceof GoogleDriveApiError ? e.reason : void 0);
+          if (this.isNotFound(e)) {
+            this.stateManager.remove(path);
+          } else {
+            this.stats.failed++;
+            this.stats.errors.push({ path, message });
+          }
         }
+        this.completedPushItems++;
+        this.stats.processed = this.completedPushItems;
+        this.stats.detail = "";
+        this.reportPushProgress();
+        await this.afterWorkItem();
       }
-      this.updateStatus(this.stats.status);
-      await this.afterWorkItem();
+    };
+    const workers = Array.from({ length: Math.min(PUSH_PARALLELISM, Math.max(1, paths.length)) }, () => worker());
+    const results = await Promise.allSettled(workers);
+    for (const result of results) {
+      if (result.status === "rejected") {
+        throw result.reason;
+      }
     }
+  }
+  async withLargeUploadGate(size, fn) {
+    if (size < LARGE_UPLOAD_BYTES) {
+      return fn();
+    }
+    const previous = this.largeUploadTail;
+    let release;
+    this.largeUploadTail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+  reportPushProgress(detailPrefix, force = false) {
+    const failedSuffix = this.stats.failed ? ` (${this.stats.failed} failed)` : "";
+    const status = `Pushing ${this.stats.processed}/${this.stats.totalFiles}${failedSuffix}`;
+    const fileName = this.stats.currentFile.split("/").pop() || this.stats.currentFile;
+    const detail = detailPrefix ? this.stats.currentFile ? `${detailPrefix}: ${fileName}` : detailPrefix : this.stats.detail;
+    this.updateStatus(status, { currentFile: this.stats.currentFile, detail }, force);
+  }
+  formatBytes(bytes) {
+    if (bytes < 1024)
+      return `${bytes} B`;
+    if (bytes < 1024 * 1024)
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024)
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+  createUploadProgressHandler(path) {
+    const fileName = path.split("/").pop() || path;
+    return (uploadedBytes, totalBytes) => {
+      const pct = totalBytes > 0 ? Math.min(100, Math.round(uploadedBytes / totalBytes * 100)) : 0;
+      const detail = totalBytes > UPLOAD_PROGRESS_DETAIL_BYTES ? `Uploading ${fileName}: ${this.formatBytes(uploadedBytes)} / ${this.formatBytes(totalBytes)} (${pct}%)` : `Uploading ${fileName}: ${this.formatBytes(totalBytes)}`;
+      this.stats.detail = detail;
+      const failedSuffix = this.stats.failed ? ` (${this.stats.failed} failed)` : "";
+      const shortName = fileName.length > 24 ? `${fileName.slice(0, 21)}...` : fileName;
+      const status = totalBytes > UPLOAD_PROGRESS_DETAIL_BYTES ? `Pushing ${this.stats.processed}/${this.stats.totalFiles} \xB7 ${shortName} ${pct}%${failedSuffix}` : `Pushing ${this.stats.processed}/${this.stats.totalFiles} \xB7 ${shortName}${failedSuffix}`;
+      this.updateStatus(status, { currentFile: path, detail }, true);
+    };
   }
   isExcluded(path) {
     const statePath = this.stateManager.getStatePath();
-    return path.startsWith(".git/") || path === ".git" || path.startsWith(".trash/") || path === ".trash" || path === statePath || path.includes("/.git/");
+    const segments = path.split("/");
+    const excludedRoots = /* @__PURE__ */ new Set([
+      ".git",
+      ".trash",
+      "node_modules",
+      ".venv",
+      "venv",
+      "__pycache__",
+      ".next",
+      "dist",
+      "build",
+      "target",
+      ".cache",
+      ".turbo",
+      ".parcel-cache",
+      "coverage",
+      ".pytest_cache",
+      ".mypy_cache",
+      ".tox",
+      ".idea",
+      ".vscode"
+    ]);
+    if (path === statePath || path.startsWith(`${statePath}/`))
+      return true;
+    for (const segment of segments) {
+      if (excludedRoots.has(segment))
+        return true;
+    }
+    return false;
   }
   isConfigPath(path) {
     const configDir = this.app.vault.configDir || ".obsidian";
@@ -865,6 +1303,22 @@ var SyncEngine = class {
     const status = typeof error === "object" && error !== null && "status" in error ? error.status : void 0;
     return status === 404 || this.getErrorMessage(error).includes("404");
   }
+  isENOENT(error) {
+    const message = this.getErrorMessage(error).toLowerCase();
+    const code = typeof error === "object" && error !== null && "code" in error ? String(error.code).toLowerCase() : "";
+    return code === "enoent" || message.includes("enoent");
+  }
+  async safeStat(path) {
+    try {
+      return await this.app.vault.adapter.stat(path);
+    } catch (error) {
+      if (this.isENOENT(error)) {
+        syncDiagnostics.warn(`Skipped missing path during sync: ${path}`, path);
+        return null;
+      }
+      throw error;
+    }
+  }
   shouldProceedWithLargeDeletion(mode, count, trackedCount) {
     const percent = Math.round(count / trackedCount * 100);
     const target = mode === "pull" ? "local" : "remote";
@@ -886,7 +1340,16 @@ Continue only if this matches what you expect.`;
   }
   async collectLocalPathSet(folderPath, items = /* @__PURE__ */ new Set()) {
     this.throwIfStopped();
-    const result = await this.app.vault.adapter.list(folderPath);
+    let result;
+    try {
+      result = await this.app.vault.adapter.list(folderPath);
+    } catch (error) {
+      if (this.isENOENT(error)) {
+        syncDiagnostics.warn(`Skipped missing folder during scan: ${folderPath}`, folderPath);
+        return items;
+      }
+      throw error;
+    }
     for (const file of result.files) {
       this.throwIfStopped();
       if (!this.isExcluded(file)) {
@@ -904,7 +1367,7 @@ Continue only if this matches what you expect.`;
     return items;
   }
   async processLocalPath(path, vaultRootId) {
-    const stat = await this.app.vault.adapter.stat(path);
+    const stat = await this.safeStat(path);
     if (!stat)
       return;
     if (stat.type === "folder") {
@@ -915,11 +1378,44 @@ Continue only if this matches what you expect.`;
       return;
     }
     let state = this.stateManager.get(path);
+    if (state && stat.mtime <= state.lastSyncedMtime) {
+      return;
+    }
     const extension = path.includes(".") ? path.split(".").pop() || "" : "";
     const mimeType = this.getMimeType(extension);
     const fileName = path.split("/").pop() || path;
     const parentPath = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
     const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
+    if ((state == null ? void 0 : state.driveId) && stat.mtime > state.lastSyncedMtime) {
+      let updated = false;
+      await this.withLargeUploadGate(stat.size, async () => {
+        const upload = await this.readStableLocalFile(path, stat);
+        if (!upload) {
+          updated = true;
+          return;
+        }
+        try {
+          const onProgress = this.createUploadProgressHandler(path);
+          const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType, onProgress);
+          this.updateCachedRemoteFile(driveParentId, remoteFile);
+          this.stateManager.set(path, {
+            ...state,
+            lastSyncedMtime: upload.stat.mtime,
+            remoteMtime: remoteFile.modifiedTime
+          });
+          await this.deferIfChangedAfterUpload(path, upload.stat);
+          await this.flushStateIfNeeded();
+          updated = true;
+        } catch (e) {
+          if (!this.isNotFound(e))
+            throw e;
+          this.stateManager.remove(path);
+          state = void 0;
+        }
+      });
+      if (updated)
+        return;
+    }
     const existingRemote = await this.findRemoteFileByName(driveParentId, parentPath, fileName);
     if (state && existingRemote && state.driveId !== existingRemote.id) {
       state = { ...state, driveId: existingRemote.id, remoteMtime: existingRemote.modifiedTime };
@@ -927,32 +1423,38 @@ Continue only if this matches what you expect.`;
       await this.flushStateIfNeeded();
     }
     if (!state) {
-      const upload = await this.readStableLocalFile(path, stat);
-      if (!upload)
-        return;
-      const remoteFile = existingRemote ? await this.client.updateFile(existingRemote.id, upload.content, mimeType) : await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType);
-      this.updateCachedRemoteFile(driveParentId, remoteFile);
-      this.stateManager.set(path, {
-        driveId: remoteFile.id,
-        lastSyncedMtime: upload.stat.mtime,
-        remoteMtime: remoteFile.modifiedTime,
-        etag: ""
+      await this.withLargeUploadGate(stat.size, async () => {
+        const upload = await this.readStableLocalFile(path, stat);
+        if (!upload)
+          return;
+        const onProgress = this.createUploadProgressHandler(path);
+        const remoteFile = existingRemote ? await this.client.updateFile(existingRemote.id, upload.content, mimeType, onProgress) : await this.client.uploadFile(fileName, driveParentId, upload.content, mimeType, onProgress);
+        this.updateCachedRemoteFile(driveParentId, remoteFile);
+        this.stateManager.set(path, {
+          driveId: remoteFile.id,
+          lastSyncedMtime: upload.stat.mtime,
+          remoteMtime: remoteFile.modifiedTime,
+          etag: ""
+        });
+        await this.deferIfChangedAfterUpload(path, upload.stat);
+        await this.flushStateIfNeeded();
       });
-      await this.deferIfChangedAfterUpload(path, upload.stat);
-      await this.flushStateIfNeeded();
     } else if (stat.mtime > state.lastSyncedMtime) {
-      const upload = await this.readStableLocalFile(path, stat);
-      if (!upload)
-        return;
-      const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType);
-      this.updateCachedRemoteFile(driveParentId, remoteFile);
-      this.stateManager.set(path, {
-        ...state,
-        lastSyncedMtime: upload.stat.mtime,
-        remoteMtime: remoteFile.modifiedTime
+      await this.withLargeUploadGate(stat.size, async () => {
+        const upload = await this.readStableLocalFile(path, stat);
+        if (!upload)
+          return;
+        const onProgress = this.createUploadProgressHandler(path);
+        const remoteFile = await this.client.updateFile(state.driveId, upload.content, mimeType, onProgress);
+        this.updateCachedRemoteFile(driveParentId, remoteFile);
+        this.stateManager.set(path, {
+          ...state,
+          lastSyncedMtime: upload.stat.mtime,
+          remoteMtime: remoteFile.modifiedTime
+        });
+        await this.deferIfChangedAfterUpload(path, upload.stat);
+        await this.flushStateIfNeeded();
       });
-      await this.deferIfChangedAfterUpload(path, upload.stat);
-      await this.flushStateIfNeeded();
     }
   }
   async ensureRemotePathByPath(path, vaultRootId) {
@@ -969,8 +1471,8 @@ Continue only if this matches what you expect.`;
     const folderName = parts.pop() || "";
     const parentPath = parts.join("/");
     const parentDriveId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
-    const existingFolders = await this.client.listFolders(parentDriveId);
-    const existing = existingFolders.find((f) => f.name.toLowerCase() === folderName.toLowerCase());
+    const existingItems = await this.listCanonicalRemoteItems(parentDriveId, parentPath);
+    const existing = existingItems.find((f) => f.mimeType === GOOGLE_FOLDER_MIME_TYPE && f.name.toLowerCase() === folderName.toLowerCase());
     if (existing) {
       this.stateManager.set(path, {
         driveId: existing.id,
@@ -1130,11 +1632,13 @@ Continue only if this matches what you expect.`;
           if (isSessionExpiredError(e))
             throw e;
           console.error(`Failed to pull ${path}`, e);
+          const message = this.getErrorMessage(e);
+          syncDiagnostics.error(message, path, e instanceof GoogleDriveApiError ? e.status : void 0, e instanceof GoogleDriveApiError ? e.reason : void 0);
           if (this.isNotFound(e)) {
             this.stateManager.remove(path);
           } else {
             this.stats.failed++;
-            this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+            this.stats.errors.push({ path, message });
           }
         }
         this.updateStatus(this.stats.status);
@@ -1236,7 +1740,7 @@ Continue only if this matches what you expect.`;
       await this.flushStateIfNeeded();
     }
     const existsLocal = await this.app.vault.adapter.exists(path);
-    const localStat = existsLocal ? await this.app.vault.adapter.stat(path) : null;
+    const localStat = existsLocal ? await this.safeStat(path) : null;
     if ((localStat == null ? void 0 : localStat.type) === "file" && await this.shouldDeferActiveLocalFile(path, localStat)) {
       return;
     }
@@ -1374,7 +1878,7 @@ Continue only if this matches what you expect.`;
       try {
         if (await this.app.vault.adapter.exists(path)) {
           this.updateStatus(`Deleting local: ${path}`);
-          const stat = await this.app.vault.adapter.stat(path);
+          const stat = await this.safeStat(path);
           if ((stat == null ? void 0 : stat.type) === "file" && this.isOpenFilePath(path)) {
             this.addDeferredFile(path, "open in Obsidian");
             continue;
@@ -1419,7 +1923,7 @@ Continue only if this matches what you expect.`;
       await this.ensureLocalPath(folderPath);
     }
     await this.app.vault.adapter.writeBinary(path, content);
-    const stat = await this.app.vault.adapter.stat(path);
+    const stat = await this.safeStat(path);
     this.stateManager.set(path, {
       driveId: remoteFile.id,
       lastSyncedMtime: stat ? stat.mtime : Date.now(),
@@ -1449,7 +1953,7 @@ Continue only if this matches what you expect.`;
   async hasUnsyncedLocalDescendant(folderPath) {
     const descendants = await this.listAllLocalItems(folderPath);
     for (const path of descendants) {
-      const stat = await this.app.vault.adapter.stat(path);
+      const stat = await this.safeStat(path);
       if (!stat || stat.type !== "file")
         continue;
       const state = this.stateManager.get(path);
@@ -1461,24 +1965,30 @@ Continue only if this matches what you expect.`;
     return false;
   }
   async shouldDeferActiveLocalFile(path, stat) {
-    const localStat = stat != null ? stat : await this.app.vault.adapter.stat(path);
+    const localStat = stat != null ? stat : await this.safeStat(path);
     if (!localStat || localStat.type !== "file")
       return false;
-    if (this.isOpenFilePath(path)) {
-      this.addDeferredFile(path, "open in Obsidian");
-      return true;
-    }
     const graceMs = this.getLocalEditGraceMs(path);
     const ageMs = Date.now() - localStat.mtime;
     if (ageMs < graceMs) {
-      this.addDeferredFile(path, "recent local edit");
+      const reason = this.isOpenFilePath(path) ? "open and recently edited" : "recent local edit";
+      this.addDeferredFile(path, reason);
       return true;
     }
     return false;
   }
   async readStableLocalFile(path, stat) {
-    const content = await this.app.vault.adapter.readBinary(path);
-    const latestStat = await this.app.vault.adapter.stat(path);
+    let content;
+    try {
+      content = await this.app.vault.adapter.readBinary(path);
+    } catch (error) {
+      if (this.isENOENT(error)) {
+        syncDiagnostics.warn(`Skipped missing file during read: ${path}`, path);
+        return null;
+      }
+      throw error;
+    }
+    const latestStat = await this.safeStat(path);
     if (!latestStat || latestStat.type !== "file") {
       this.addDeferredFile(path, "changed while syncing");
       return null;
@@ -1490,7 +2000,7 @@ Continue only if this matches what you expect.`;
     return { content, stat: latestStat };
   }
   async deferIfChangedAfterUpload(path, syncedStat) {
-    const latestStat = await this.app.vault.adapter.stat(path);
+    const latestStat = await this.safeStat(path);
     if (!latestStat || latestStat.type !== "file")
       return;
     if (latestStat.mtime !== syncedStat.mtime || latestStat.size !== syncedStat.size) {
@@ -2285,6 +2795,7 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
   constructor(app, plugin) {
     super(app, plugin);
     this.authCode = "";
+    this.showCredentials = false;
     this.plugin = plugin;
   }
   display() {
@@ -2299,8 +2810,30 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       new import_obsidian8.Setting(step1).setName("Keys Saved \u2713").setDesc("Your Client ID and Secret are configured.").addButton((btn) => btn.setButtonText("Edit Keys").onClick(() => {
         this.plugin.settings.clientId = "";
         this.plugin.settings.clientSecret = "";
+        this.showCredentials = false;
         this.display();
       }));
+      new import_obsidian8.Setting(step1).setName("Another vault setup").setDesc("Show your saved Client ID and Secret to paste into Tether on another vault or device.").addButton((btn) => btn.setButtonText(this.showCredentials ? "Hide credentials" : "Show credentials").onClick(() => {
+        this.showCredentials = !this.showCredentials;
+        this.display();
+      }));
+      if (this.showCredentials) {
+        new import_obsidian8.Setting(step1).setName("Client ID").addText((text) => text.setValue(this.plugin.settings.clientId).setDisabled(true));
+        new import_obsidian8.Setting(step1).setName("Client Secret").addText((text) => text.setValue(this.plugin.settings.clientSecret).setDisabled(true));
+        new import_obsidian8.Setting(step1).setName("Copy credentials").setDesc("Copy both values to paste into another vault's Tether settings.").addButton((btn) => btn.setButtonText("Copy").onClick(async () => {
+          const text = [
+            `Client ID: ${this.plugin.settings.clientId}`,
+            `Client Secret: ${this.plugin.settings.clientSecret}`
+          ].join("\n");
+          try {
+            await navigator.clipboard.writeText(text);
+            new import_obsidian8.Notice("Credentials copied to clipboard.");
+          } catch (e) {
+            console.error("Failed to copy credentials", e);
+            new import_obsidian8.Notice("Failed to copy credentials.");
+          }
+        }));
+      }
     } else {
       new import_obsidian8.Setting(step1).setName("Setup Guide").setDesc("First, follow this guide to get your keys.").addButton((button) => button.setButtonText("Open Guide").onClick(() => new SetupGuideModal(this.app).open()));
       new import_obsidian8.Setting(step1).setName("Client ID").addText((text) => text.setPlaceholder("Enter Client ID").setValue(this.plugin.settings.clientId).onChange(async (value) => {

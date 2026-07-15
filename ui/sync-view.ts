@@ -1,4 +1,5 @@
-import { ItemView, Notice, WorkspaceLeaf, TFile } from 'obsidian';
+import { ItemView, Notice, WorkspaceLeaf, TFile, normalizePath } from 'obsidian';
+import { syncDiagnostics } from '../sync/diagnostics';
 
 export const VIEW_TYPE_SYNC_STATUS = 'gdrive-sync-status-view';
 
@@ -7,6 +8,7 @@ export interface SyncStats {
 	processed: number;
 	failed: number;
 	currentFile: string;
+	detail: string;
 	status: string;
 	lastSync: string;
 	errors: { path: string, message: string }[];
@@ -20,6 +22,7 @@ export class SyncStatusView extends ItemView {
 		processed: 0,
 		failed: 0,
 		currentFile: '',
+		detail: '',
 		status: 'Idle',
 		lastSync: 'Never',
 		errors: [],
@@ -63,6 +66,7 @@ export class SyncStatusView extends ItemView {
 
 		container.createEl('h3', { text: 'Sync Status' });
 		this.createSyncActions(container);
+		this.createDiagnosticsActions(container);
 
 		const statsGrid = container.createDiv({ cls: 'sync-stats-grid' });
 		
@@ -78,6 +82,18 @@ export class SyncStatusView extends ItemView {
 
 		if (this.stats.currentFile) {
 			container.createEl('p', { text: `Currently: ${this.stats.currentFile}`, cls: 'current-file-text' });
+		}
+
+		if (this.stats.detail) {
+			container.createEl('p', { text: this.stats.detail, cls: 'sync-detail-text' });
+		}
+
+		if (this.stats.totalFiles > 0 && this.stats.status !== 'Idle') {
+			const pct = Math.min(100, Math.round((this.stats.processed / this.stats.totalFiles) * 100));
+			const bar = container.createDiv({ cls: 'sync-progress-bar' });
+			const fill = bar.createDiv({ cls: 'sync-progress-fill' });
+			fill.style.width = `${pct}%`;
+			container.createEl('p', { text: `${pct}% of vault items checked`, cls: 'sync-progress-label' });
 		}
 
 		// Conflicts Section
@@ -150,6 +166,43 @@ export class SyncStatusView extends ItemView {
 		const stat = parent.createDiv({ cls: 'sync-stat' });
 		stat.createDiv({ text: label, cls: 'stat-label' });
 		stat.createDiv({ text: value, cls: 'stat-value ' + cls });
+	}
+
+	private createDiagnosticsActions(parent: Element) {
+		const plugin = (this.app as any).plugins.getPlugin('tether');
+		const actions = parent.createDiv({ cls: 'sync-diag-row' });
+
+		const copyButton = actions.createEl('button', { text: 'Copy diagnostics' });
+		copyButton.onClickEvent(async () => {
+			try {
+				const report = syncDiagnostics.formatReport(
+					plugin?.manifest?.version || 'unknown',
+					plugin?.syncEngine?.stats || this.stats
+				);
+				await navigator.clipboard.writeText(report);
+				new Notice('Diagnostics copied to clipboard.');
+			} catch (e) {
+				console.error('Failed to copy diagnostics', e);
+				new Notice('Failed to copy diagnostics.');
+			}
+		});
+
+		const saveButton = actions.createEl('button', { text: 'Save diagnostics' });
+		saveButton.onClickEvent(async () => {
+			try {
+				const report = syncDiagnostics.formatReport(
+					plugin?.manifest?.version || 'unknown',
+					plugin?.syncEngine?.stats || this.stats
+				);
+				const configDir = this.app.vault.configDir || '.obsidian';
+				const path = normalizePath(`${configDir}/tether-diagnostics.txt`);
+				await this.app.vault.adapter.write(path, report);
+				new Notice('Diagnostics saved to .obsidian/tether-diagnostics.txt');
+			} catch (e) {
+				console.error('Failed to save diagnostics', e);
+				new Notice('Failed to save diagnostics.');
+			}
+		});
 	}
 
 	private createSyncActions(parent: Element) {

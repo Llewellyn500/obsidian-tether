@@ -1,5 +1,6 @@
 import { requestUrl, RequestUrlParam } from 'obsidian';
 import { OAuthManager, OAuthTokenResponse } from '../auth/oauth';
+import { syncDiagnostics } from './diagnostics';
 
 export interface DriveFile {
 	id: string;
@@ -15,10 +16,26 @@ export interface DriveFilePage {
 	nextPageToken?: string;
 }
 
+const REQUEST_MIN_SPACING_MS = 35;
+const REQUEST_MAX_SPACING_MS = 250;
+const REQUEST_MAX_CONCURRENT = 3;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
+const MAX_RETRIES = 6;
+const CHUNK_SIZE = 512 * 1024;
+const CHUNK_THRESHOLD = 256 * 1024;
+
 export class SessionExpiredError extends Error {
 	constructor(message = 'Session expired. Please log in again.') {
 		super(message);
 		this.name = 'SessionExpiredError';
+	}
+}
+
+export class RequestTimeoutError extends Error {
+	constructor(message = 'Google Drive request timed out.') {
+		super(message);
+		this.name = 'RequestTimeoutError';
 	}
 }
 
@@ -41,11 +58,74 @@ export function isSessionExpiredError(error: unknown): boolean {
 		(error instanceof Error && error.name === 'SessionExpiredError');
 }
 
+class RequestQueue {
+	private active = 0;
+	private pending: Array<() => void> = [];
+	private lastRequestAt = 0;
+	private spacingMs = REQUEST_MIN_SPACING_MS;
+	private paceTail: Promise<void> = Promise.resolve();
+
+	schedule<T>(fn: () => Promise<T>): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const start = () => {
+				this.active++;
+				void this.run(fn).then(resolve, reject).finally(() => {
+					this.active--;
+					this.pump();
+				});
+			};
+
+			this.pending.push(start);
+			this.pump();
+		});
+	}
+
+	private pump() {
+		while (this.active < REQUEST_MAX_CONCURRENT && this.pending.length > 0) {
+			const next = this.pending.shift();
+			if (next) next();
+		}
+	}
+
+	private async run<T>(fn: () => Promise<T>): Promise<T> {
+		await this.pace();
+		return fn();
+	}
+
+	private pace(): Promise<void> {
+		this.paceTail = this.paceTail.then(async () => {
+			const elapsed = Date.now() - this.lastRequestAt;
+			const waitMs = Math.max(0, this.spacingMs - elapsed);
+			if (waitMs > 0) {
+				await sleep(waitMs);
+			}
+			this.lastRequestAt = Date.now();
+		});
+		return this.paceTail;
+	}
+
+	/** Speeds up after successful calls; slows down when Google rate-limits. */
+	adaptAfterSuccess() {
+		this.spacingMs = Math.max(REQUEST_MIN_SPACING_MS, Math.floor(this.spacingMs * 0.9));
+	}
+
+	adaptAfterRateLimit() {
+		this.spacingMs = Math.min(REQUEST_MAX_SPACING_MS, Math.ceil(this.spacingMs * 1.75) + 20);
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => window.setTimeout(resolve, ms));
+}
+
+export type UploadProgressCallback = (uploadedBytes: number, totalBytes: number) => void;
+
 export class GoogleDriveClient {
 	accessToken: string;
 	onTokenRefresh?: (tokens: any) => Promise<void>;
 	refreshParams?: { refreshToken: string, clientId: string, clientSecret: string };
 	private refreshPromise?: Promise<void>;
+	private requestQueue = new RequestQueue();
 
 	constructor(accessToken: string, onTokenRefresh?: (tokens: any) => Promise<void>, refreshParams?: { refreshToken: string, clientId: string, clientSecret: string }) {
 		this.accessToken = accessToken;
@@ -53,7 +133,55 @@ export class GoogleDriveClient {
 		this.refreshParams = refreshParams;
 	}
 
-	private async request(options: RequestUrlParam, retry: boolean = true): Promise<any> {
+	private async request(options: RequestUrlParam, retryAuth = true): Promise<any> {
+		return this.requestQueue.schedule(() => this.requestWithRetries(options, retryAuth));
+	}
+
+	private async requestWithRetries(options: RequestUrlParam, retryAuth: boolean): Promise<any> {
+		let attempt = 0;
+
+		while (true) {
+			try {
+				const response = await this.executeRequest(options, retryAuth);
+				this.requestQueue.adaptAfterSuccess();
+				return response;
+			} catch (error) {
+				if (error instanceof SessionExpiredError) throw error;
+				if (error instanceof RequestTimeoutError) {
+					if (attempt < MAX_RETRIES) {
+						attempt++;
+						const delayMs = this.getRetryDelayMs(attempt);
+						syncDiagnostics.warn(`Request timed out, retrying in ${delayMs}ms`, undefined, undefined, 'timeout');
+						await sleep(delayMs);
+						continue;
+					}
+					throw new GoogleDriveApiError(0, 'Google Drive request timed out after multiple retries.', 'timeout', 'Check your network connection and try again.');
+				}
+
+				if (error instanceof GoogleDriveApiError && this.isRetryable(error.status, error.reason, error.message)) {
+					if (this.isRateLimitError(error.status, error.reason, error.message)) {
+						this.requestQueue.adaptAfterRateLimit();
+					}
+					if (attempt < MAX_RETRIES) {
+						attempt++;
+						const delayMs = this.getRetryDelayMs(attempt, error);
+						syncDiagnostics.warn(
+							`Drive API retry ${attempt}/${MAX_RETRIES} in ${delayMs}ms: ${error.message}`,
+							undefined,
+							error.status,
+							error.reason
+						);
+						await sleep(delayMs);
+						continue;
+					}
+				}
+
+				throw error;
+			}
+		}
+	}
+
+	private async executeRequest(options: RequestUrlParam, retryAuth: boolean): Promise<any> {
 		const requestOptions: RequestUrlParam = {
 			...options,
 			throw: false,
@@ -62,28 +190,51 @@ export class GoogleDriveClient {
 				'Authorization': `Bearer ${this.accessToken}`
 			}
 		};
-		
+
+		const timeoutMs = this.getTimeoutForRequest(options);
 		let response;
+
 		try {
-			response = await requestUrl(requestOptions);
+			response = await this.requestWithTimeout(requestOptions, timeoutMs);
 		} catch (error: unknown) {
+			if (error instanceof RequestTimeoutError) throw error;
 			const status = typeof error === 'object' && error !== null && 'status' in error
 				? (error as { status?: number }).status
 				: undefined;
-			if (status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+			if (status === 401 && retryAuth && this.refreshParams && this.onTokenRefresh) {
 				return await this.handleRefresh(options);
 			}
 			throw this.toApiError(error);
 		}
-		
-		if (response.status === 401 && retry && this.refreshParams && this.onTokenRefresh) {
+
+		if (response.status === 401 && retryAuth && this.refreshParams && this.onTokenRefresh) {
 			return await this.handleRefresh(options);
+		}
+
+		if (response.status === 308) {
+			return response;
 		}
 
 		if (response.status >= 400) {
 			throw this.toApiError(response);
 		}
+
 		return response;
+	}
+
+	private async requestWithTimeout(options: RequestUrlParam, timeoutMs: number): Promise<any> {
+		let timeoutId: number | undefined;
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			timeoutId = window.setTimeout(() => reject(new RequestTimeoutError()), timeoutMs);
+		});
+
+		try {
+			return await Promise.race([requestUrl(options), timeoutPromise]);
+		} finally {
+			if (timeoutId !== undefined) {
+				window.clearTimeout(timeoutId);
+			}
+		}
 	}
 
 	private async handleRefresh(options: RequestUrlParam): Promise<any> {
@@ -171,6 +322,14 @@ export class GoogleDriveClient {
 		const normalizedReason = (reason || '').toLowerCase();
 		const normalizedMessage = message.toLowerCase();
 
+		if (status === 429 || this.isRateLimitError(status, reason, message)) {
+			return 'Google Drive rate limit reached. Tether will retry automatically; large vaults may take longer to finish.';
+		}
+
+		if (status === 0 && normalizedReason === 'timeout') {
+			return 'A Drive request timed out. Check your network connection and retry sync.';
+		}
+
 		if (status === 403 && (
 			normalizedReason.includes('accessnotconfigured') ||
 			normalizedMessage.includes('api has not been used') ||
@@ -192,6 +351,69 @@ export class GoogleDriveClient {
 		}
 
 		return undefined;
+	}
+
+	private isRateLimitError(status: number, reason?: string, message?: string): boolean {
+		if (status === 429) return true;
+		if (status !== 403) return false;
+
+		const normalizedReason = (reason || '').toLowerCase();
+		const normalizedMessage = (message || '').toLowerCase();
+		return normalizedReason.includes('ratelimit') ||
+			normalizedReason.includes('userlimit') ||
+			normalizedReason.includes('sharingratelimit') ||
+			normalizedMessage.includes('rate limit') ||
+			normalizedMessage.includes('quota');
+	}
+
+	private isRetryable(status: number, reason?: string, message?: string): boolean {
+		return this.isRateLimitError(status, reason, message) || status >= 500;
+	}
+
+	private getRetryDelayMs(attempt: number, error?: GoogleDriveApiError): number {
+		if (error?.status === 429 || this.isRateLimitError(error?.status || 0, error?.reason, error?.message)) {
+			return Math.min(30_000, 2_000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+		}
+		return Math.min(60_000, 1_000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+	}
+
+	private getTimeoutForRequest(options: RequestUrlParam): number {
+		const method = (options.method || 'GET').toUpperCase();
+		if (method === 'PUT' || method === 'POST' || method === 'PATCH') {
+			return UPLOAD_REQUEST_TIMEOUT_MS;
+		}
+		return DEFAULT_REQUEST_TIMEOUT_MS;
+	}
+
+	private getContentLength(content: ArrayBuffer | string | Uint8Array): number {
+		if (typeof content === 'string') {
+			return new TextEncoder().encode(content).byteLength;
+		}
+		if (content instanceof Uint8Array) {
+			return content.byteLength;
+		}
+		return content.byteLength;
+	}
+
+	private toByteArray(content: ArrayBuffer | string): Uint8Array {
+		if (typeof content === 'string') {
+			return new TextEncoder().encode(content);
+		}
+		return new Uint8Array(content);
+	}
+
+	/** Reuse the underlying buffer when possible to avoid doubling RAM on every upload. */
+	private toRequestBody(bytes: Uint8Array): ArrayBuffer {
+		if (
+			bytes.byteOffset === 0 &&
+			bytes.byteLength === bytes.buffer.byteLength &&
+			bytes.buffer instanceof ArrayBuffer
+		) {
+			return bytes.buffer;
+		}
+		const copy = new Uint8Array(bytes.byteLength);
+		copy.set(bytes);
+		return copy.buffer;
 	}
 
 	async listFiles(folderId: string): Promise<DriveFile[]> {
@@ -276,12 +498,13 @@ export class GoogleDriveClient {
 		return response.json;
 	}
 
-	async uploadFile(name: string, folderId: string, content: ArrayBuffer | string, mimeType = 'text/markdown'): Promise<DriveFile> {
+	async uploadFile(name: string, folderId: string, content: ArrayBuffer | string, mimeType = 'text/markdown', onProgress?: UploadProgressCallback): Promise<DriveFile> {
 		const metadata = {
 			name,
 			parents: [folderId],
 			mimeType
 		};
+		const contentLength = this.getContentLength(content);
 
 		const initUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size';
 		const initResponse = await this.request({
@@ -290,6 +513,7 @@ export class GoogleDriveClient {
 			headers: {
 				'Content-Type': 'application/json; charset=UTF-8',
 				'X-Upload-Content-Type': mimeType,
+				'X-Upload-Content-Length': String(contentLength),
 			},
 			body: JSON.stringify(metadata)
 		});
@@ -297,19 +521,11 @@ export class GoogleDriveClient {
 		const uploadUrl = initResponse.headers['location'] || initResponse.headers['Location'];
 		if (!uploadUrl) throw new Error('Failed to get resumable upload URL');
 
-		const uploadResponse = await this.request({
-			url: uploadUrl,
-			method: 'PUT',
-			headers: {
-				'Content-Type': mimeType
-			},
-			body: content
-		});
-
-		return uploadResponse.json;
+		return this.uploadResumableContent(uploadUrl, content, mimeType, onProgress);
 	}
 
-	async updateFile(fileId: string, content: ArrayBuffer | string, mimeType = 'text/markdown'): Promise<DriveFile> {
+	async updateFile(fileId: string, content: ArrayBuffer | string, mimeType = 'text/markdown', onProgress?: UploadProgressCallback): Promise<DriveFile> {
+		const contentLength = this.getContentLength(content);
 		const initUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=resumable&fields=id,name,mimeType,modifiedTime,md5Checksum,size`;
 		const initResponse = await this.request({
 			url: initUrl,
@@ -317,6 +533,7 @@ export class GoogleDriveClient {
 			headers: {
 				'Content-Type': 'application/json; charset=UTF-8',
 				'X-Upload-Content-Type': mimeType,
+				'X-Upload-Content-Length': String(contentLength),
 			},
 			body: JSON.stringify({})
 		});
@@ -324,16 +541,67 @@ export class GoogleDriveClient {
 		const uploadUrl = initResponse.headers['location'] || initResponse.headers['Location'];
 		if (!uploadUrl) throw new Error('Failed to get resumable update URL');
 
-		const uploadResponse = await this.request({
-			url: uploadUrl,
-			method: 'PUT',
-			headers: {
-				'Content-Type': mimeType
-			},
-			body: content
-		});
+		return this.uploadResumableContent(uploadUrl, content, mimeType, onProgress);
+	}
 
-		return uploadResponse.json;
+	private async uploadResumableContent(uploadUrl: string, content: ArrayBuffer | string, mimeType: string, onProgress?: UploadProgressCallback): Promise<DriveFile> {
+		const total = this.getContentLength(content);
+		onProgress?.(0, total);
+
+		// Do not set Content-Length: Obsidian/Chromium requestUrl rejects it with net::ERR_INVALID_ARGUMENT.
+		if (total <= CHUNK_THRESHOLD) {
+			const body = typeof content === 'string'
+				? this.toRequestBody(this.toByteArray(content))
+				: content;
+			const uploadResponse = await this.request({
+				url: uploadUrl,
+				method: 'PUT',
+				headers: {
+					'Content-Type': mimeType,
+				},
+				body
+			});
+			onProgress?.(total, total);
+			return uploadResponse.json;
+		}
+
+		// Large files: keep one Uint8Array view (no full copy), copy only each chunk for the request.
+		const bytes = this.toByteArray(content);
+		let offset = 0;
+		while (offset < total) {
+			const end = Math.min(offset + CHUNK_SIZE, total);
+			const chunk = bytes.subarray(offset, end);
+			const isLast = end === total;
+			const headers: Record<string, string> = {
+				'Content-Range': `bytes ${offset}-${end - 1}/${total}`,
+			};
+
+			if (isLast) {
+				headers['Content-Type'] = mimeType;
+			}
+
+			onProgress?.(offset, total);
+
+			const uploadResponse = await this.request({
+				url: uploadUrl,
+				method: 'PUT',
+				headers,
+				body: this.toRequestBody(chunk)
+			});
+
+			offset = end;
+			onProgress?.(offset, total);
+
+			if (isLast) {
+				return uploadResponse.json;
+			}
+
+			if (uploadResponse.status !== 308) {
+				throw new Error(`Unexpected resumable upload response: ${uploadResponse.status}`);
+			}
+		}
+
+		throw new Error('Resumable upload completed without final response.');
 	}
 
 	async getUserInfo(): Promise<{ email: string }> {
