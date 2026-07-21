@@ -11,7 +11,7 @@ const STARTUP_PULL_DELAY_MS = 5000;
 const BACKGROUND_SYNC_IDLE_DELAY_MS = 60000;
 const ACCESS_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 55 * 60 * 1000;
-
+ 
 interface GoogleDriveSyncSettings {
 	accessToken: string;
 	accessTokenExpiresAt: number;
