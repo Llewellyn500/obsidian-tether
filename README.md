@@ -94,7 +94,9 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Pull now refuses to delete the local vault when the Drive vault root looks empty or completely mismatched. Push also refuses to delete every tracked remote item when the local vault looks empty or completely mismatched.
 - If a startup/manual pull or manual push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
-- Tether checks each Drive folder for duplicate same-name files, folds differing duplicate content into the chosen file's Drive revision history, then removes the extra Drive files.
+- Tether prevents parallel workers and retrying requests from creating multiple Drive folders for the same vault path.
+- When Tether encounters duplicate same-name folders, it recursively moves their contents into one canonical folder and moves each empty duplicate folder to Drive Trash.
+- Byte-identical duplicate files are moved to Drive Trash. Differing same-name files are both preserved, with the extra copy renamed using a `Tether conflict` suffix.
 - Tether excludes `.git`, `.trash`, `node_modules`, `.venv` / `venv`, `__pycache__`, common build folders (`.next`, `dist`, `build`, `target`), and its own sync state file at `.obsidian/gdrive-sync.json`.
 
 ## Compatibility

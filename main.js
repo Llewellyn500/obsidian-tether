@@ -41,6 +41,8 @@ var StateManager = class {
     this.dirty = false;
     this.pendingChanges = 0;
     this.lastSavedAt = 0;
+    this.revision = 0;
+    this.saveTail = Promise.resolve();
     this.plugin = plugin;
   }
   getStatePath() {
@@ -48,19 +50,34 @@ var StateManager = class {
     return (0, import_obsidian.normalizePath)(`${configDir}/gdrive-sync.json`);
   }
   async load() {
+    await this.saveTail;
     const data = await this.plugin.app.vault.adapter.read(this.getStatePath()).catch(() => "{}");
     this.state = JSON.parse(data);
     this.dirty = false;
     this.pendingChanges = 0;
     this.lastSavedAt = Date.now();
+    this.revision = 0;
   }
   async save() {
+    const queuedSave = this.saveTail.then(() => this.saveSnapshot(), () => this.saveSnapshot());
+    this.saveTail = queuedSave.catch(() => {
+    });
+    await queuedSave;
+  }
+  async saveSnapshot() {
     if (!this.dirty)
       return;
-    await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state));
-    this.dirty = false;
-    this.pendingChanges = 0;
+    const savedRevision = this.revision;
+    const savedChangeCount = this.pendingChanges;
+    const serializedState = JSON.stringify(this.state);
+    await this.plugin.app.vault.adapter.write(this.getStatePath(), serializedState);
     this.lastSavedAt = Date.now();
+    if (this.revision === savedRevision) {
+      this.dirty = false;
+      this.pendingChanges = 0;
+    } else {
+      this.pendingChanges = Math.max(0, this.pendingChanges - savedChangeCount);
+    }
   }
   shouldSave(changeLimit, maxAgeMs) {
     return this.dirty && (this.pendingChanges >= changeLimit || Date.now() - this.lastSavedAt >= maxAgeMs);
@@ -91,6 +108,7 @@ var StateManager = class {
   markDirty() {
     this.dirty = true;
     this.pendingChanges++;
+    this.revision++;
   }
 };
 
@@ -301,6 +319,7 @@ var UPLOAD_REQUEST_TIMEOUT_MS = 12e4;
 var MAX_RETRIES = 6;
 var CHUNK_SIZE = 512 * 1024;
 var CHUNK_THRESHOLD = 256 * 1024;
+var DRIVE_FILE_FIELDS = "id,name,mimeType,createdTime,modifiedTime,md5Checksum,size,parents,trashed";
 var SessionExpiredError = class extends Error {
   constructor(message = "Session expired. Please log in again.") {
     super(message);
@@ -379,11 +398,12 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 var GoogleDriveClient = class {
-  constructor(accessToken, onTokenRefresh, refreshParams) {
+  constructor(accessToken, onTokenRefresh, refreshParams, folderIdReservations = /* @__PURE__ */ new Map()) {
     this.requestQueue = new RequestQueue();
     this.accessToken = accessToken;
     this.onTokenRefresh = onTokenRefresh;
     this.refreshParams = refreshParams;
+    this.folderIdReservations = folderIdReservations;
   }
   async request(options, retryAuth = true) {
     return this.requestQueue.schedule(() => this.requestWithRetries(options, retryAuth));
@@ -616,6 +636,14 @@ var GoogleDriveClient = class {
     const response = await this.request({ url, method: "GET" });
     return response.arrayBuffer;
   }
+  async getFile(fileId) {
+    const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+    const response = await this.request({
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+      method: "GET"
+    });
+    return response.json;
+  }
   async listFolders(parentId = "root") {
     let files = [];
     let pageToken;
@@ -637,7 +665,7 @@ var GoogleDriveClient = class {
     }
     const params = new URLSearchParams({
       q: qParts.join(" and "),
-      fields: "nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)",
+      fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
       pageSize: "100",
       corpora: "user",
       spaces: "drive"
@@ -655,17 +683,93 @@ var GoogleDriveClient = class {
     };
   }
   async createFolder(name, parentId) {
+    var _a;
+    const reservationKey = JSON.stringify([parentId || "", name.toLowerCase()]);
+    const reservation = this.reserveFolderId(reservationKey);
+    const id = await reservation;
     const metadata = {
+      id,
       name,
       mimeType: "application/vnd.google-apps.folder",
       parents: parentId ? [parentId] : []
     };
-    const url = "https://www.googleapis.com/drive/v3/files";
+    const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+    try {
+      const response = await this.request({
+        url: `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(metadata)
+      });
+      this.releaseFolderId(reservationKey, reservation);
+      return response.json;
+    } catch (error) {
+      const shouldReconcile = error instanceof GoogleDriveApiError && (error.status === 409 || error.status === 0 || this.isRetryable(error.status, error.reason, error.message));
+      if (!shouldReconcile)
+        throw error;
+      let existing;
+      try {
+        existing = await this.getFile(id);
+      } catch (e) {
+        throw error;
+      }
+      const hasExpectedParent = !parentId || ((_a = existing.parents) == null ? void 0 : _a.includes(parentId)) === true;
+      if (existing.trashed || existing.mimeType !== "application/vnd.google-apps.folder" || existing.name.toLowerCase() !== name.toLowerCase() || !hasExpectedParent) {
+        throw error;
+      }
+      this.releaseFolderId(reservationKey, reservation);
+      return existing;
+    }
+  }
+  reserveFolderId(key) {
+    const existing = this.folderIdReservations.get(key);
+    if (existing)
+      return existing;
+    const reservation = this.generateFileId().catch((error) => {
+      this.releaseFolderId(key, reservation);
+      throw error;
+    });
+    this.folderIdReservations.set(key, reservation);
+    return reservation;
+  }
+  releaseFolderId(key, reservation) {
+    if (this.folderIdReservations.get(key) === reservation) {
+      this.folderIdReservations.delete(key);
+    }
+  }
+  async generateFileId() {
+    var _a;
+    const params = new URLSearchParams({ count: "1", space: "drive", type: "files" });
     const response = await this.request({
-      url,
-      method: "POST",
+      url: `https://www.googleapis.com/drive/v3/files/generateIds?${params.toString()}`,
+      method: "GET"
+    });
+    const id = (_a = response.json.ids) == null ? void 0 : _a[0];
+    if (!id)
+      throw new Error("Google Drive did not return a generated file ID.");
+    return id;
+  }
+  async moveFile(fileId, fromParentId, toParentId, name) {
+    const params = new URLSearchParams({
+      addParents: toParentId,
+      removeParents: fromParentId,
+      fields: DRIVE_FILE_FIELDS
+    });
+    const response = await this.request({
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(metadata)
+      body: JSON.stringify(name ? { name } : {})
+    });
+    return response.json;
+  }
+  async renameFile(fileId, name) {
+    const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+    const response = await this.request({
+      url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
     });
     return response.json;
   }
@@ -766,6 +870,15 @@ var GoogleDriveClient = class {
   async deleteFile(fileId) {
     const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
     await this.request({ url, method: "DELETE" });
+  }
+  async trashFile(fileId) {
+    const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+    await this.request({
+      url,
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trashed: true })
+    });
   }
 };
 
@@ -997,7 +1110,9 @@ var SyncStoppedError = class extends Error {
 var SyncEngine = class {
   constructor(app, client, stateManager, folderId, statusBarItem) {
     this.folderCache = /* @__PURE__ */ new Map();
+    this.folderEnsurePromises = /* @__PURE__ */ new Map();
     this.remoteFolderCache = /* @__PURE__ */ new Map();
+    this.remoteFolderLoadPromises = /* @__PURE__ */ new Map();
     this.silent = false;
     this.statusUpdateIntervalMs = MANUAL_STATUS_UPDATE_MS;
     this.lastStatusUpdateAt = 0;
@@ -1064,7 +1179,9 @@ var SyncEngine = class {
       this.stats.deferred = [];
       this.stats.detail = "";
       this.folderCache.clear();
+      this.folderEnsurePromises.clear();
       this.remoteFolderCache.clear();
+      this.remoteFolderLoadPromises.clear();
       const mode = (_c = options.mode) != null ? _c : "push";
       const modeLabel = mode === "pull" ? "Pull" : "Push";
       syncDiagnostics.startSession(mode);
@@ -1377,15 +1494,15 @@ Continue only if this matches what you expect.`;
     if (await this.shouldDeferActiveLocalFile(path, stat)) {
       return;
     }
-    let state = this.stateManager.get(path);
-    if (state && stat.mtime <= state.lastSyncedMtime) {
-      return;
-    }
     const extension = path.includes(".") ? path.split(".").pop() || "" : "";
     const mimeType = this.getMimeType(extension);
     const fileName = path.split("/").pop() || path;
     const parentPath = path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
     const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
+    let state = this.stateManager.get(path);
+    if (state && stat.mtime <= state.lastSyncedMtime) {
+      return;
+    }
     if ((state == null ? void 0 : state.driveId) && stat.mtime > state.lastSyncedMtime) {
       let updated = false;
       await this.withLargeUploadGate(stat.size, async () => {
@@ -1462,11 +1579,21 @@ Continue only if this matches what you expect.`;
       return vaultRootId;
     if (this.folderCache.has(path))
       return this.folderCache.get(path);
-    const state = this.stateManager.get(path);
-    if (state) {
-      this.folderCache.set(path, state.driveId);
-      return state.driveId;
+    const promiseKey = path.toLowerCase();
+    const pending = this.folderEnsurePromises.get(promiseKey);
+    if (pending)
+      return pending;
+    const ensurePromise = this.resolveRemotePathByPath(path, vaultRootId);
+    this.folderEnsurePromises.set(promiseKey, ensurePromise);
+    try {
+      return await ensurePromise;
+    } finally {
+      if (this.folderEnsurePromises.get(promiseKey) === ensurePromise) {
+        this.folderEnsurePromises.delete(promiseKey);
+      }
     }
+  }
+  async resolveRemotePathByPath(path, vaultRootId) {
     const parts = path.split("/");
     const folderName = parts.pop() || "";
     const parentPath = parts.join("/");
@@ -1485,6 +1612,7 @@ Continue only if this matches what you expect.`;
       return existing.id;
     }
     const remoteFolder = await this.client.createFolder(folderName, parentDriveId);
+    this.updateCachedRemoteFile(parentDriveId, remoteFolder);
     this.stateManager.set(path, {
       driveId: remoteFolder.id,
       lastSyncedMtime: 0,
@@ -1504,10 +1632,23 @@ Continue only if this matches what you expect.`;
     if (this.remoteFolderCache.has(folderId)) {
       return this.remoteFolderCache.get(folderId);
     }
-    const items = await this.client.listFiles(folderId);
-    const canonicalItems = await this.consolidateDuplicateRemoteFiles(folderId, parentPath, items);
-    this.remoteFolderCache.set(folderId, canonicalItems);
-    return canonicalItems;
+    const pending = this.remoteFolderLoadPromises.get(folderId);
+    if (pending)
+      return pending;
+    const loadPromise = (async () => {
+      const items = await this.client.listFiles(folderId);
+      const canonicalItems = await this.consolidateDuplicateRemoteItems(folderId, parentPath, items);
+      this.remoteFolderCache.set(folderId, canonicalItems);
+      return canonicalItems;
+    })();
+    this.remoteFolderLoadPromises.set(folderId, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      if (this.remoteFolderLoadPromises.get(folderId) === loadPromise) {
+        this.remoteFolderLoadPromises.delete(folderId);
+      }
+    }
   }
   updateCachedRemoteFile(folderId, file) {
     const cached = this.remoteFolderCache.get(folderId);
@@ -1520,75 +1661,156 @@ Continue only if this matches what you expect.`;
       cached.push(file);
     }
   }
-  async consolidateDuplicateRemoteFiles(folderId, parentPath, items) {
-    const fileGroups = /* @__PURE__ */ new Map();
+  async consolidateDuplicateRemoteItems(_folderId, parentPath, items) {
+    const itemGroups = /* @__PURE__ */ new Map();
     const canonicalItems = [];
     for (const item of items) {
-      if (this.canMergeRemoteFile(item)) {
-        const key = item.name.toLowerCase();
-        const group = fileGroups.get(key) || [];
+      if (item.mimeType === GOOGLE_FOLDER_MIME_TYPE || this.canMergeRemoteFile(item)) {
+        const type = item.mimeType === GOOGLE_FOLDER_MIME_TYPE ? "folder" : "file";
+        const key = `${type}:${item.name.toLowerCase()}`;
+        const group = itemGroups.get(key) || [];
         group.push(item);
-        fileGroups.set(key, group);
+        itemGroups.set(key, group);
       } else {
         canonicalItems.push(item);
       }
     }
-    for (const group of fileGroups.values()) {
+    for (const group of itemGroups.values()) {
       if (group.length === 1) {
         canonicalItems.push(group[0]);
         continue;
       }
+      const isFolderGroup = group[0].mimeType === GOOGLE_FOLDER_MIME_TYPE;
       try {
-        canonicalItems.push(await this.mergeDuplicateRemoteFiles(group, parentPath));
+        canonicalItems.push(isFolderGroup ? await this.mergeDuplicateRemoteFolders(group, parentPath) : await this.mergeDuplicateRemoteFiles(group, parentPath));
       } catch (e) {
-        if (isSessionExpiredError(e))
+        if (isSessionExpiredError(e) || e instanceof SyncStoppedError)
           throw e;
         const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
         console.error(`Failed to merge Drive duplicates for ${displayName}`, e);
         this.stats.failed++;
-        this.stats.errors.push({ path: displayName, message: `Failed to merge duplicate Drive files: ${this.getErrorMessage(e)}` });
-        canonicalItems.push(this.chooseCanonicalRemoteFile(group, parentPath));
+        this.stats.errors.push({
+          path: displayName,
+          message: `Failed to merge duplicate Drive ${isFolderGroup ? "folders" : "files"}: ${this.getErrorMessage(e)}`
+        });
+        if (isFolderGroup) {
+          throw e;
+        } else {
+          canonicalItems.push(this.chooseCanonicalRemoteItem(group));
+        }
       }
     }
     return canonicalItems;
   }
-  async mergeDuplicateRemoteFiles(group, parentPath) {
-    const displayName = parentPath ? `${parentPath}/${group[0].name}` : group[0].name;
-    const sorted = [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime());
-    const canonical = this.chooseCanonicalRemoteFile(sorted, parentPath);
-    const latest = sorted[sorted.length - 1];
-    const restoreCanonicalHead = latest.id === canonical.id;
-    const canonicalOriginalContent = restoreCanonicalHead ? await this.client.downloadFile(canonical.id) : null;
-    let canonicalFile = canonical;
-    let wroteRevision = false;
-    this.updateStatus(`Merging duplicates: ${displayName}`);
-    for (const duplicate of sorted) {
+  async mergeDuplicateRemoteFolders(group, parentPath) {
+    const canonical = this.chooseCanonicalRemoteItem(group);
+    const displayName = parentPath ? `${parentPath}/${canonical.name}` : canonical.name;
+    this.updateStatus(`Merging duplicate folders: ${displayName}`);
+    for (const duplicate of group) {
       if (duplicate.id === canonical.id)
         continue;
-      if (!this.sameRemoteContent(canonicalFile, duplicate)) {
-        const duplicateContent = await this.client.downloadFile(duplicate.id);
-        canonicalFile = await this.client.updateFile(canonical.id, duplicateContent, duplicate.mimeType);
-        wroteRevision = true;
+      this.throwIfStopped();
+      const canonicalItems = await this.client.listFiles(canonical.id);
+      const duplicateItems = await this.client.listFiles(duplicate.id);
+      for (const child of duplicateItems) {
+        this.throwIfStopped();
+        const sameName = canonicalItems.filter((item) => item.name.toLowerCase() === child.name.toLowerCase());
+        const childIsFolder = child.mimeType === GOOGLE_FOLDER_MIME_TYPE;
+        const hasFolderCollision = sameName.some((item) => item.mimeType === GOOGLE_FOLDER_MIME_TYPE);
+        const hasFileCollision = sameName.some((item) => item.mimeType !== GOOGLE_FOLDER_MIME_TYPE);
+        let moved;
+        if (sameName.length === 0 || childIsFolder && hasFolderCollision && !hasFileCollision) {
+          moved = await this.client.moveFile(child.id, duplicate.id, canonical.id);
+        } else if (childIsFolder || hasFolderCollision) {
+          throw new Error(`Cannot safely merge "${displayName}" because "${child.name}" exists as both a file and a folder.`);
+        } else {
+          const original = this.chooseCanonicalRemoteItem(sameName);
+          if (this.sameRemoteContent(original, child)) {
+            this.repointStateEntry(child.id, original.id, original.modifiedTime);
+            await this.flushStateIfNeeded(true);
+            this.throwIfStopped();
+            await this.client.trashFile(child.id);
+            continue;
+          }
+          const conflictName = this.makeRemoteConflictName(child.name, child.id, canonicalItems);
+          this.removeStateEntriesForDriveId(child.id);
+          await this.flushStateIfNeeded(true);
+          this.throwIfStopped();
+          moved = await this.client.moveFile(child.id, duplicate.id, canonical.id, conflictName);
+          syncDiagnostics.warn(`Preserved differing Drive duplicate as "${conflictName}".`, `${displayName}/${child.name}`);
+        }
+        canonicalItems.push(moved);
+        await this.flushStateIfNeeded();
       }
-      await this.client.deleteFile(duplicate.id);
-      this.repointStateEntry(duplicate.id, canonical.id, canonicalFile.modifiedTime);
+      this.remoteFolderCache.delete(canonical.id);
+      this.remoteFolderCache.delete(duplicate.id);
+      const remaining = await this.client.listFiles(duplicate.id);
+      if (remaining.length > 0) {
+        throw new Error(`Drive folder "${displayName}" still contains ${remaining.length} item${remaining.length === 1 ? "" : "s"} after merge.`);
+      }
+      this.repointStateEntry(duplicate.id, canonical.id, canonical.modifiedTime);
+      await this.flushStateIfNeeded(true);
+      this.throwIfStopped();
+      await this.client.trashFile(duplicate.id);
     }
-    if (restoreCanonicalHead && wroteRevision && canonicalOriginalContent) {
-      canonicalFile = await this.client.updateFile(canonical.id, canonicalOriginalContent, canonical.mimeType);
-    }
-    this.repointStateEntry(canonical.id, canonical.id, canonicalFile.modifiedTime);
+    this.remoteFolderCache.delete(canonical.id);
+    this.throwIfStopped();
+    await this.listCanonicalRemoteItems(canonical.id, displayName);
+    this.repointStateEntry(canonical.id, canonical.id, canonical.modifiedTime);
     await this.flushStateIfNeeded();
-    return { ...canonicalFile, name: canonical.name || canonicalFile.name };
+    return canonical;
   }
-  chooseCanonicalRemoteFile(group, parentPath) {
-    const stateMatch = group.find((item) => {
-      var _a;
-      const exactPath = parentPath ? `${parentPath}/${item.name}` : item.name;
-      return ((_a = this.stateManager.get(exactPath)) == null ? void 0 : _a.driveId) === item.id || Object.values(this.stateManager.state).some((entry) => entry.driveId === item.id);
-    });
-    if (stateMatch)
-      return stateMatch;
-    return [...group].sort((a, b) => new Date(a.modifiedTime).getTime() - new Date(b.modifiedTime).getTime())[0];
+  makeRemoteConflictName(name, driveId, items) {
+    const dot = name.lastIndexOf(".");
+    const hasExtension = dot > 0;
+    const base = hasExtension ? name.slice(0, dot) : name;
+    const extension = hasExtension ? name.slice(dot) : "";
+    const suffix = ` (Tether conflict ${driveId.slice(0, 8)})`;
+    const taken = new Set(items.map((item) => item.name.toLowerCase()));
+    let candidate = `${base}${suffix}${extension}`;
+    let counter = 2;
+    while (taken.has(candidate.toLowerCase())) {
+      candidate = `${base}${suffix} ${counter}${extension}`;
+      counter++;
+    }
+    return candidate;
+  }
+  async mergeDuplicateRemoteFiles(group, parentPath) {
+    const canonical = this.chooseCanonicalRemoteItem(group);
+    const displayName = parentPath ? `${parentPath}/${canonical.name}` : canonical.name;
+    const resolvedItems = [canonical];
+    this.updateStatus(`Merging duplicates: ${displayName}`);
+    for (const duplicate of group) {
+      if (duplicate.id === canonical.id)
+        continue;
+      this.throwIfStopped();
+      if (this.sameRemoteContent(canonical, duplicate)) {
+        this.repointStateEntry(duplicate.id, canonical.id, canonical.modifiedTime);
+        await this.flushStateIfNeeded(true);
+        this.throwIfStopped();
+        await this.client.trashFile(duplicate.id);
+      } else {
+        const conflictName = this.makeRemoteConflictName(duplicate.name, duplicate.id, resolvedItems);
+        this.removeStateEntriesForDriveId(duplicate.id);
+        await this.flushStateIfNeeded(true);
+        this.throwIfStopped();
+        const renamed = await this.client.renameFile(duplicate.id, conflictName);
+        resolvedItems.push(renamed);
+        syncDiagnostics.warn(`Preserved differing Drive duplicate as "${conflictName}".`, displayName);
+      }
+    }
+    this.repointStateEntry(canonical.id, canonical.id, canonical.modifiedTime);
+    await this.flushStateIfNeeded();
+    return canonical;
+  }
+  chooseCanonicalRemoteItem(group) {
+    return [...group].sort((a, b) => {
+      const aTime = new Date(a.createdTime || a.modifiedTime).getTime();
+      const bTime = new Date(b.createdTime || b.modifiedTime).getTime();
+      if (aTime !== bTime)
+        return aTime - bTime;
+      return a.id.localeCompare(b.id);
+    })[0];
   }
   repointStateEntry(oldDriveId, newDriveId, remoteMtime) {
     for (const [path, entry] of Object.entries(this.stateManager.state)) {
@@ -1600,12 +1822,24 @@ Continue only if this matches what you expect.`;
         });
       }
     }
+    for (const [path, driveId] of this.folderCache.entries()) {
+      if (driveId === oldDriveId) {
+        this.folderCache.set(path, newDriveId);
+      }
+    }
+  }
+  removeStateEntriesForDriveId(driveId) {
+    for (const [path, entry] of Object.entries(this.stateManager.state)) {
+      if (entry.driveId === driveId) {
+        this.stateManager.remove(path);
+      }
+    }
   }
   canMergeRemoteFile(file) {
     return file.mimeType !== GOOGLE_FOLDER_MIME_TYPE && !file.mimeType.startsWith("application/vnd.google-apps.");
   }
   sameRemoteContent(a, b) {
-    return !!a.md5Checksum && !!b.md5Checksum && a.md5Checksum === b.md5Checksum;
+    return a.mimeType === b.mimeType && !!a.size && !!b.size && a.size === b.size && !!a.md5Checksum && !!b.md5Checksum && a.md5Checksum === b.md5Checksum;
   }
   async processRemoteTree(folderId, remotePathSet, parentPath = "", depth = 0, locallyDeletedPaths = /* @__PURE__ */ new Set()) {
     if (depth > 50)
@@ -1656,7 +1890,11 @@ Continue only if this matches what you expect.`;
     const stateKey = `__VAULT_ROOT__`;
     const state = this.stateManager.get(stateKey);
     const folders = await this.client.listFolders(this.folderId);
-    const candidates = folders.filter((f) => f.name.toLowerCase() === name.toLowerCase());
+    let candidates = folders.filter((f) => f.name.toLowerCase() === name.toLowerCase());
+    if (candidates.length > 1) {
+      const canonical = await this.mergeDuplicateRemoteFolders(candidates, "");
+      candidates = [canonical];
+    }
     if (!createIfMissing) {
       const selected = await this.selectPullVaultRoot(name, candidates, state == null ? void 0 : state.driveId);
       if (!selected) {
@@ -1665,8 +1903,9 @@ Continue only if this matches what you expect.`;
       await this.saveVaultRootState(selected);
       return selected.id;
     }
-    if (state)
-      return state.driveId;
+    const stateCandidate = candidates.find((folder) => folder.id === (state == null ? void 0 : state.driveId));
+    if (stateCandidate)
+      return stateCandidate.id;
     const existing = candidates[0];
     if (existing) {
       await this.saveVaultRootState(existing);
@@ -2350,6 +2589,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     this.startupPullTimeoutId = null;
     this.backgroundSyncIntervalId = null;
     this.startupPullRanThisSession = false;
+    this.folderIdReservations = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.loadSettings();
@@ -2454,12 +2694,12 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   initializeClient() {
     this.client = new GoogleDriveClient(this.settings.accessToken, async (tokens) => {
       this.applyTokenResponse(tokens);
-      await this.saveSettings();
+      await this.saveData(this.settings);
     }, {
       refreshToken: this.settings.refreshToken,
       clientId: this.settings.clientId,
       clientSecret: this.settings.clientSecret
-    });
+    }, this.folderIdReservations);
   }
   setupSyncEngine() {
     if (!this.settings.folderId)

@@ -6,9 +6,12 @@ export interface DriveFile {
 	id: string;
 	name: string;
 	mimeType: string;
+	createdTime?: string;
 	modifiedTime: string;
 	md5Checksum?: string;
 	size?: string;
+	parents?: string[];
+	trashed?: boolean;
 }
 
 export interface DriveFilePage {
@@ -24,6 +27,7 @@ const UPLOAD_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 6;
 const CHUNK_SIZE = 512 * 1024;
 const CHUNK_THRESHOLD = 256 * 1024;
+const DRIVE_FILE_FIELDS = 'id,name,mimeType,createdTime,modifiedTime,md5Checksum,size,parents,trashed';
 
 export class SessionExpiredError extends Error {
 	constructor(message = 'Session expired. Please log in again.') {
@@ -126,11 +130,18 @@ export class GoogleDriveClient {
 	refreshParams?: { refreshToken: string, clientId: string, clientSecret: string };
 	private refreshPromise?: Promise<void>;
 	private requestQueue = new RequestQueue();
+	private folderIdReservations: Map<string, Promise<string>>;
 
-	constructor(accessToken: string, onTokenRefresh?: (tokens: any) => Promise<void>, refreshParams?: { refreshToken: string, clientId: string, clientSecret: string }) {
+	constructor(
+		accessToken: string,
+		onTokenRefresh?: (tokens: any) => Promise<void>,
+		refreshParams?: { refreshToken: string, clientId: string, clientSecret: string },
+		folderIdReservations: Map<string, Promise<string>> = new Map()
+	) {
 		this.accessToken = accessToken;
 		this.onTokenRefresh = onTokenRefresh;
 		this.refreshParams = refreshParams;
+		this.folderIdReservations = folderIdReservations;
 	}
 
 	private async request(options: RequestUrlParam, retryAuth = true): Promise<any> {
@@ -437,6 +448,15 @@ export class GoogleDriveClient {
 		return response.arrayBuffer;
 	}
 
+	async getFile(fileId: string): Promise<DriveFile> {
+		const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+		const response = await this.request({
+			url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+			method: 'GET'
+		});
+		return response.json;
+	}
+
 	async listFolders(parentId: string = 'root'): Promise<DriveFile[]> {
 		let files: DriveFile[] = [];
 		let pageToken: string | undefined;
@@ -461,7 +481,7 @@ export class GoogleDriveClient {
 
 		const params = new URLSearchParams({
 			q: qParts.join(' and '),
-			fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,size)',
+			fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
 			pageSize: '100',
 			corpora: 'user',
 			spaces: 'drive'
@@ -483,17 +503,101 @@ export class GoogleDriveClient {
 	}
 
 	async createFolder(name: string, parentId?: string): Promise<DriveFile> {
+		const reservationKey = JSON.stringify([parentId || '', name.toLowerCase()]);
+		const reservation = this.reserveFolderId(reservationKey);
+		const id = await reservation;
 		const metadata = {
+			id,
 			name,
 			mimeType: 'application/vnd.google-apps.folder',
 			parents: parentId ? [parentId] : []
 		};
-		const url = 'https://www.googleapis.com/drive/v3/files';
+		const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+
+		try {
+			const response = await this.request({
+				url: `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(metadata)
+			});
+			this.releaseFolderId(reservationKey, reservation);
+			return response.json;
+		} catch (error) {
+			const shouldReconcile = error instanceof GoogleDriveApiError &&
+				(error.status === 409 || error.status === 0 || this.isRetryable(error.status, error.reason, error.message));
+			if (!shouldReconcile) throw error;
+
+			let existing: DriveFile;
+			try {
+				existing = await this.getFile(id);
+			} catch {
+				// Keep this ID reserved: a timed-out create can still finish after this call returns.
+				throw error;
+			}
+			const hasExpectedParent = !parentId || existing.parents?.includes(parentId) === true;
+			if (existing.trashed ||
+				existing.mimeType !== 'application/vnd.google-apps.folder' ||
+				existing.name.toLowerCase() !== name.toLowerCase() ||
+				!hasExpectedParent) {
+				throw error;
+			}
+			this.releaseFolderId(reservationKey, reservation);
+			return existing;
+		}
+	}
+
+	private reserveFolderId(key: string): Promise<string> {
+		const existing = this.folderIdReservations.get(key);
+		if (existing) return existing;
+
+		const reservation = this.generateFileId().catch(error => {
+			this.releaseFolderId(key, reservation);
+			throw error;
+		});
+		this.folderIdReservations.set(key, reservation);
+		return reservation;
+	}
+
+	private releaseFolderId(key: string, reservation: Promise<string>) {
+		if (this.folderIdReservations.get(key) === reservation) {
+			this.folderIdReservations.delete(key);
+		}
+	}
+
+	private async generateFileId(): Promise<string> {
+		const params = new URLSearchParams({ count: '1', space: 'drive', type: 'files' });
 		const response = await this.request({
-			url,
-			method: 'POST',
+			url: `https://www.googleapis.com/drive/v3/files/generateIds?${params.toString()}`,
+			method: 'GET'
+		});
+		const id = response.json.ids?.[0];
+		if (!id) throw new Error('Google Drive did not return a generated file ID.');
+		return id;
+	}
+
+	async moveFile(fileId: string, fromParentId: string, toParentId: string, name?: string): Promise<DriveFile> {
+		const params = new URLSearchParams({
+			addParents: toParentId,
+			removeParents: fromParentId,
+			fields: DRIVE_FILE_FIELDS
+		});
+		const response = await this.request({
+			url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+			method: 'PATCH',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(metadata)
+			body: JSON.stringify(name ? { name } : {})
+		});
+		return response.json;
+	}
+
+	async renameFile(fileId: string, name: string): Promise<DriveFile> {
+		const params = new URLSearchParams({ fields: DRIVE_FILE_FIELDS });
+		const response = await this.request({
+			url: `https://www.googleapis.com/drive/v3/files/${fileId}?${params.toString()}`,
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name })
 		});
 		return response.json;
 	}
@@ -615,5 +719,15 @@ export class GoogleDriveClient {
 	async deleteFile(fileId: string): Promise<void> {
 		const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
 		await this.request({ url, method: 'DELETE' });
+	}
+
+	async trashFile(fileId: string): Promise<void> {
+		const url = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+		await this.request({
+			url,
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ trashed: true })
+		});
 	}
 }

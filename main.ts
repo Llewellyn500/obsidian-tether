@@ -59,6 +59,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 	private startupPullTimeoutId: number | null = null;
 	private backgroundSyncIntervalId: number | null = null;
 	private startupPullRanThisSession = false;
+	private folderIdReservations = new Map<string, Promise<string>>();
 
 	async onload() {
 		await this.loadSettings();
@@ -195,13 +196,15 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 			this.settings.accessToken,
 			async (tokens: OAuthTokenResponse) => {
 				this.applyTokenResponse(tokens);
-				await this.saveSettings();
+				// Keep this client instance so in-flight retry reservations survive token refresh.
+				await this.saveData(this.settings);
 			},
 			{
 				refreshToken: this.settings.refreshToken,
 				clientId: this.settings.clientId,
 				clientSecret: this.settings.clientSecret
-			}
+			},
+			this.folderIdReservations
 		);
 	}
 

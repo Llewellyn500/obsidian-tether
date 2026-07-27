@@ -15,6 +15,8 @@ export class StateManager {
 	private dirty = false;
 	private pendingChanges = 0;
 	private lastSavedAt = 0;
+	private revision = 0;
+	private saveTail: Promise<void> = Promise.resolve();
 
 	constructor(plugin: any) {
 		this.plugin = plugin;
@@ -26,20 +28,39 @@ export class StateManager {
 	}
 
 	async load() {
+		await this.saveTail;
 		const data = await this.plugin.app.vault.adapter.read(this.getStatePath()).catch(() => '{}');
 		this.state = JSON.parse(data);
 		this.dirty = false;
 		this.pendingChanges = 0;
 		this.lastSavedAt = Date.now();
+		this.revision = 0;
 	}
 
 	async save() {
+		const queuedSave = this.saveTail.then(
+			() => this.saveSnapshot(),
+			() => this.saveSnapshot()
+		);
+		this.saveTail = queuedSave.catch(() => {});
+		await queuedSave;
+	}
+
+	private async saveSnapshot() {
 		if (!this.dirty) return;
 
-		await this.plugin.app.vault.adapter.write(this.getStatePath(), JSON.stringify(this.state));
-		this.dirty = false;
-		this.pendingChanges = 0;
+		const savedRevision = this.revision;
+		const savedChangeCount = this.pendingChanges;
+		const serializedState = JSON.stringify(this.state);
+		await this.plugin.app.vault.adapter.write(this.getStatePath(), serializedState);
 		this.lastSavedAt = Date.now();
+
+		if (this.revision === savedRevision) {
+			this.dirty = false;
+			this.pendingChanges = 0;
+		} else {
+			this.pendingChanges = Math.max(0, this.pendingChanges - savedChangeCount);
+		}
 	}
 
 	shouldSave(changeLimit: number, maxAgeMs: number): boolean {
@@ -81,5 +102,6 @@ export class StateManager {
 	private markDirty() {
 		this.dirty = true;
 		this.pendingChanges++;
+		this.revision++;
 	}
 }

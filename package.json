@@ -1,11 +1,12 @@
 {
   "name": "tether",
-  "version": "1.0.12",
+  "version": "1.0.14",
   "description": "A high-performance Google Drive sync engine by Llewellyn Paintsil.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
+    "test": "node tests/run.mjs",
     "version": "node version-bump.mjs && git add manifest.json versions.json"
   },
   "keywords": [
