@@ -19,6 +19,11 @@ export interface DriveFilePage {
 	nextPageToken?: string;
 }
 
+export interface DriveDownloadChunk {
+	content: ArrayBuffer;
+	status: number;
+}
+
 const REQUEST_MIN_SPACING_MS = 35;
 const REQUEST_MAX_SPACING_MS = 250;
 const REQUEST_MAX_CONCURRENT = 3;
@@ -428,11 +433,11 @@ export class GoogleDriveClient {
 	}
 
 	async listFiles(folderId: string): Promise<DriveFile[]> {
-		let files: DriveFile[] = [];
+		const files: DriveFile[] = [];
 		let pageToken: string | undefined;
 		do {
 			const page = await this.listFilesPage(folderId, pageToken);
-			files = files.concat(page.files);
+			files.push(...page.files);
 			pageToken = page.nextPageToken;
 		} while (pageToken);
 		return files;
@@ -457,12 +462,22 @@ export class GoogleDriveClient {
 		return response.json;
 	}
 
+	async downloadFileRange(fileId: string, start: number, end: number): Promise<DriveDownloadChunk> {
+		const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+		const response = await this.request({
+			url,
+			method: 'GET',
+			headers: { 'Range': `bytes=${start}-${end}` }
+		});
+		return { content: response.arrayBuffer, status: response.status };
+	}
+
 	async listFolders(parentId: string = 'root'): Promise<DriveFile[]> {
-		let files: DriveFile[] = [];
+		const files: DriveFile[] = [];
 		let pageToken: string | undefined;
 		do {
 			const page = await this.listFoldersPage(parentId, pageToken);
-			files = files.concat(page.files);
+			files.push(...page.files);
 			pageToken = page.nextPageToken;
 		} while (pageToken);
 		return files;

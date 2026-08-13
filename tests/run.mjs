@@ -20,6 +20,16 @@ const obsidianStub = {
 			loader: 'ts',
 			contents: `
 				export class Notice { constructor(_message?: string) {} }
+				export const Platform = {
+					isDesktop: true,
+					isMobile: false,
+					isDesktopApp: true,
+					isMobileApp: false,
+					isIosApp: false,
+					isAndroidApp: false,
+					isPhone: false,
+					isTablet: false
+				};
 				export class ItemView {
 					containerEl: any = {};
 					constructor(_leaf?: any) {}

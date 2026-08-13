@@ -282,6 +282,19 @@ test('folder creation retries reuse one pre-generated Drive ID', async () => {
 	assert.equal(requests.filter(request => request.method === 'POST').length, 1);
 });
 
+test('range downloads request only the selected bytes', async () => {
+	const client = new GoogleDriveClient('token') as any;
+	client.request = async (options: any) => {
+		assert.equal(options.method, 'GET');
+		assert.equal(options.headers.Range, 'bytes=2097152-4194303');
+		return { status: 206, arrayBuffer: new ArrayBuffer(2 * 1024 * 1024) };
+	};
+
+	const chunk = await client.downloadFileRange('large-video', 2 * 1024 * 1024, 4 * 1024 * 1024 - 1);
+	assert.equal(chunk.status, 206);
+	assert.equal(chunk.content.byteLength, 2 * 1024 * 1024);
+});
+
 test('a failed folder creation invocation keeps its generated ID reserved', async () => {
 	const reservations = new Map<string, Promise<string>>();
 	const firstClient = new GoogleDriveClient('token-1', undefined, undefined, reservations) as any;

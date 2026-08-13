@@ -1,7 +1,8 @@
-import { App, Notice } from 'obsidian';
+import { App, Notice, Platform } from 'obsidian';
 import type { Stat } from 'obsidian';
 import { GoogleDriveClient, DriveFile, GoogleDriveApiError, isSessionExpiredError } from './gdrive';
 import { StateManager } from './state';
+import type { SyncEntry } from './state';
 import { syncDiagnostics } from './diagnostics';
 import { SyncStatusView, SyncStats, VIEW_TYPE_SYNC_STATUS } from '../ui/sync-view';
 
@@ -9,13 +10,43 @@ const RECENT_LOCAL_EDIT_GRACE_MS = 30000;
 const DRAWING_LOCAL_EDIT_GRACE_MS = 30000;
 const STATE_SAVE_CHANGE_LIMIT = 40;
 const STATE_SAVE_INTERVAL_MS = 10000;
+const MOBILE_STATE_SAVE_CHANGE_LIMIT = 120;
+const MOBILE_STATE_SAVE_INTERVAL_MS = 20000;
 const MANUAL_STATUS_UPDATE_MS = 500;
+const MOBILE_STATUS_UPDATE_MS = 1000;
 const BACKGROUND_STATUS_UPDATE_MS = 3000;
 const WORK_YIELD_ITEM_LIMIT = 15;
+const MOBILE_WORK_YIELD_ITEM_LIMIT = 4;
+const MOBILE_WORK_YIELD_MS = 16;
 const CATASTROPHIC_DELETE_RATIO = 0.8;
 const UPLOAD_PROGRESS_DETAIL_BYTES = 256 * 1024;
 const PUSH_PARALLELISM = 3;
 const LARGE_UPLOAD_BYTES = 2 * 1024 * 1024;
+const MOBILE_CHUNKED_DOWNLOAD_BYTES = 4 * 1024 * 1024;
+const MOBILE_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+const PARTIAL_DOWNLOAD_SUFFIX = '.tether-part';
+const EXCLUDED_PATH_SEGMENTS = new Set([
+	'.git',
+	'.codex-worktrees',
+	'.trash',
+	'node_modules',
+	'.venv',
+	'venv',
+	'__pycache__',
+	'.next',
+	'dist',
+	'build',
+	'target',
+	'.cache',
+	'.turbo',
+	'.parcel-cache',
+	'coverage',
+	'.pytest_cache',
+	'.mypy_cache',
+	'.tox',
+	'.idea',
+	'.vscode',
+]);
 
 export type SyncMode = 'pull' | 'push';
 const GOOGLE_FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
@@ -31,6 +62,12 @@ interface SyncOptions {
 	mode?: SyncMode;
 	silent?: boolean;
 	statusUpdateIntervalMs?: number;
+}
+
+interface RemoteScanTracker {
+	seenCount: number;
+	trackedCount: number;
+	pendingDeletionPaths: Set<string>;
 }
 
 export class SyncEngine {
@@ -78,7 +115,10 @@ export class SyncEngine {
 	}
 
 	updateStatus(text: string, partialStats?: Partial<SyncStats>, force = false) {
-		this.stats = { ...this.stats, status: text, ...partialStats };
+		// This runs for every item in a large sync. Mutating the stable stats object avoids
+		// producing thousands of short-lived copies that put pressure on mobile garbage collection.
+		this.stats.status = text;
+		if (partialStats) Object.assign(this.stats, partialStats);
 
 		const now = Date.now();
 		const shouldRender = force ||
@@ -109,7 +149,11 @@ export class SyncEngine {
 		const previousSilent = this.silent;
 		const previousStatusUpdateIntervalMs = this.statusUpdateIntervalMs;
 		this.silent = options.silent ?? false;
-		this.statusUpdateIntervalMs = options.statusUpdateIntervalMs ?? (this.silent ? BACKGROUND_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS);
+		this.statusUpdateIntervalMs = options.statusUpdateIntervalMs ?? (
+			this.silent
+				? BACKGROUND_STATUS_UPDATE_MS
+				: (Platform.isMobileApp ? MOBILE_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS)
+		);
 		this.lastStatusUpdateAt = 0;
 		this.processedSinceYield = 0;
 		this.stopRequested = false;
@@ -187,9 +231,22 @@ export class SyncEngine {
 		this.stats.totalFiles = 0;
 		this.updateStatus('Pulling changes...');
 
-		const remotePathSet = new Set<string>();
-		await this.processRemoteTree(vaultRootDriveId, remotePathSet);
-		if (remotePathSet.size === 0) {
+		// Track only previously-known paths that have not been seen. A first pull no longer
+		// retains a second copy of every remote path while the state map is being populated.
+		const pendingDeletionPaths = new Set<string>();
+		for (const path of Object.keys(this.stateManager.state)) {
+			if (path !== '__VAULT_ROOT__' && !this.isExcluded(path)) {
+				pendingDeletionPaths.add(path);
+			}
+		}
+		const tracker: RemoteScanTracker = {
+			seenCount: 0,
+			trackedCount: pendingDeletionPaths.size,
+			pendingDeletionPaths
+		};
+
+		await this.processRemoteTree(vaultRootDriveId, tracker);
+		if (tracker.seenCount === 0) {
 			const msg = 'Pull found an empty Drive vault root. No local files were changed. Check the selected Google Drive folder/account, or use Push if this is a new empty Drive setup.';
 			console.error(msg);
 			new Notice(msg);
@@ -198,7 +255,7 @@ export class SyncEngine {
 			return;
 		}
 
-		await this.handleRemoteDeletions(remotePathSet);
+		await this.handleRemoteDeletions(tracker);
 	}
 
 	private async pushToRemote(vaultRootDriveId: string) {
@@ -321,32 +378,12 @@ export class SyncEngine {
 	private isExcluded(path: string): boolean {
 		const statePath = this.stateManager.getStatePath();
 		const segments = path.split('/');
-		const excludedRoots = new Set([
-			'.git',
-			'.trash',
-			'node_modules',
-			'.venv',
-			'venv',
-			'__pycache__',
-			'.next',
-			'dist',
-			'build',
-			'target',
-			'.cache',
-			'.turbo',
-			'.parcel-cache',
-			'coverage',
-			'.pytest_cache',
-			'.mypy_cache',
-			'.tox',
-			'.idea',
-			'.vscode',
-		]);
 
 		if (path === statePath || path.startsWith(`${statePath}/`)) return true;
+		if (path.endsWith(PARTIAL_DOWNLOAD_SUFFIX)) return true;
 
 		for (const segment of segments) {
-			if (excludedRoots.has(segment)) return true;
+			if (EXCLUDED_PATH_SEGMENTS.has(segment)) return true;
 		}
 
 		return false;
@@ -385,7 +422,9 @@ export class SyncEngine {
 	}
 
 	private async flushStateIfNeeded(force = false) {
-		if (force || this.stateManager.shouldSave(STATE_SAVE_CHANGE_LIMIT, STATE_SAVE_INTERVAL_MS)) {
+		const changeLimit = Platform.isMobileApp ? MOBILE_STATE_SAVE_CHANGE_LIMIT : STATE_SAVE_CHANGE_LIMIT;
+		const intervalMs = Platform.isMobileApp ? MOBILE_STATE_SAVE_INTERVAL_MS : STATE_SAVE_INTERVAL_MS;
+		if (force || this.stateManager.shouldSave(changeLimit, intervalMs)) {
 			await this.stateManager.save();
 		}
 	}
@@ -395,9 +434,11 @@ export class SyncEngine {
 		this.throwIfStopped();
 
 		this.processedSinceYield++;
-		if (this.processedSinceYield >= WORK_YIELD_ITEM_LIMIT) {
+		const yieldItemLimit = Platform.isMobileApp ? MOBILE_WORK_YIELD_ITEM_LIMIT : WORK_YIELD_ITEM_LIMIT;
+		if (this.processedSinceYield >= yieldItemLimit) {
 			this.processedSinceYield = 0;
-			await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+			const delayMs = Platform.isMobileApp ? MOBILE_WORK_YIELD_MS : 0;
+			await new Promise<void>(resolve => window.setTimeout(resolve, delayMs));
 			this.throwIfStopped();
 		}
 	}
@@ -907,7 +948,7 @@ export class SyncEngine {
 			a.md5Checksum === b.md5Checksum;
 	}
 
-	private async processRemoteTree(folderId: string, remotePathSet: Set<string>, parentPath: string = '', depth: number = 0, locallyDeletedPaths: Set<string> = new Set()): Promise<void> {
+	private async processRemoteTree(folderId: string, tracker: RemoteScanTracker, parentPath: string = '', depth: number = 0, locallyDeletedPaths: Set<string> = new Set()): Promise<void> {
 		if (depth > 50) throw new Error('Maximum folder depth reached.');
 		this.throwIfStopped();
 		this.updateStatus(`Scanning Drive: ${parentPath || 'root'}...`);
@@ -922,7 +963,8 @@ export class SyncEngine {
 					continue;
 				}
 
-				remotePathSet.add(path);
+				tracker.seenCount++;
+				tracker.pendingDeletionPaths.delete(path);
 
 				if (this.isExcluded(path)) continue;
 
@@ -953,12 +995,16 @@ export class SyncEngine {
 				await this.afterWorkItem();
 
 				if (item.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
-					await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+					await this.processRemoteTree(item.id, tracker, path, depth + 1, locallyDeletedPaths);
 				}
 			}
 		} catch (error) {
 			console.error(`Failed to scan Drive folder ${folderId}`, error);
 			throw error;
+		} finally {
+			// Pull never needs a completed folder listing again. Releasing it here bounds
+			// memory to the current folder ancestry instead of retaining the whole vault.
+			this.remoteFolderCache.delete(folderId);
 		}
 	}
 
@@ -1197,20 +1243,20 @@ export class SyncEngine {
 		return locallyDeletedPaths;
 	}
 
-	private async handleRemoteDeletions(remotePathSet: Set<string>) {
-		const stateEntries = Object.entries(this.stateManager.state);
-		// Sort by path length descending to handle children before parents
-		const sortedEntries = stateEntries
-			.filter(([path]) => path !== '__VAULT_ROOT__' && !this.isExcluded(path))
-			.sort((a, b) => b[0].length - a[0].length);
-
-		// Collect candidates for deletion
-		const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
-		const trackedCount = sortedEntries.length;
+	private async handleRemoteDeletions(tracker: RemoteScanTracker) {
+		// Only paths left in this set were tracked before the scan and are now absent
+		// from Drive. Materialize and sort candidates only, not the entire state map.
+		const deletionCandidates: [string, SyncEntry][] = [];
+		for (const path of tracker.pendingDeletionPaths) {
+			const entry = this.stateManager.get(path);
+			if (entry) deletionCandidates.push([path, entry]);
+		}
+		deletionCandidates.sort((a, b) => b[0].length - a[0].length);
+		const trackedCount = tracker.trackedCount;
 		if (deletionCandidates.length === 0) return;
 
-		if (remotePathSet.size === 0 || deletionCandidates.length === trackedCount) {
-			const msg = remotePathSet.size === 0
+		if (tracker.seenCount === 0 || deletionCandidates.length === trackedCount) {
+			const msg = tracker.seenCount === 0
 				? `Pull paused local deletions: the Drive vault root returned no files or folders, but this device has ${trackedCount} tracked local item${trackedCount === 1 ? '' : 's'}. No local files were deleted. Check the selected Google Drive folder/account before pulling again.`
 				: `Pull paused local deletions: every tracked local item is missing from Drive (${trackedCount}/${trackedCount}). No local files were deleted. Check the selected Google Drive folder/account before pulling again.`;
 			console.error(msg);
@@ -1286,15 +1332,14 @@ export class SyncEngine {
 	}
 
 	private async download(path: string, remoteFile: DriveFile) {
-		const content = await this.client.downloadFile(remoteFile.id);
-		
 		const parts = path.split('/');
 		if (parts.length > 1) {
 			const folderPath = parts.slice(0, -1).join('/');
 			await this.ensureLocalPath(folderPath);
 		}
 
-		await this.app.vault.adapter.writeBinary(path, content);
+		const downloaded = await this.downloadAndWrite(path, remoteFile);
+		if (!downloaded) return;
 		const stat = await this.safeStat(path);
 		
 		this.stateManager.set(path, {
@@ -1303,7 +1348,106 @@ export class SyncEngine {
 			remoteMtime: remoteFile.modifiedTime,
 			etag: ''
 		});
-		await this.flushStateIfNeeded();
+		const remoteSize = this.getRemoteFileSize(remoteFile);
+		const wasChunked = Platform.isMobileApp && remoteSize !== null && remoteSize > MOBILE_CHUNKED_DOWNLOAD_BYTES;
+		await this.flushStateIfNeeded(wasChunked);
+		this.stats.detail = '';
+	}
+
+	private async downloadAndWrite(path: string, remoteFile: DriveFile): Promise<boolean> {
+		const remoteSize = this.getRemoteFileSize(remoteFile);
+		if (Platform.isMobileApp && remoteSize !== null && remoteSize > MOBILE_CHUNKED_DOWNLOAD_BYTES) {
+			if (typeof this.app.vault.adapter.appendBinary !== 'function') {
+				const reason = `large mobile download (${this.formatBytes(remoteSize)}); update Obsidian to download it safely in chunks`;
+				this.addDeferredFile(path, reason);
+				syncDiagnostics.warn(`Deferred ${reason}`, path);
+				return false;
+			}
+
+			await this.downloadLargeMobileFile(path, remoteFile.id, remoteSize);
+			return true;
+		}
+
+		// Keep the binary buffer in this small async frame so it becomes collectible before
+		// stat calls or a potentially large state serialization run on memory-limited devices.
+		const content = await this.client.downloadFile(remoteFile.id);
+		await this.app.vault.adapter.writeBinary(path, content);
+		return true;
+	}
+
+	private getRemoteFileSize(remoteFile: DriveFile): number | null {
+		if (!remoteFile.size) return null;
+		const size = Number(remoteFile.size);
+		return Number.isFinite(size) && size >= 0 ? size : null;
+	}
+
+	private async downloadLargeMobileFile(path: string, driveId: string, totalBytes: number) {
+		const tempPath = `${path}${PARTIAL_DOWNLOAD_SUFFIX}`;
+		if (await this.app.vault.adapter.exists(tempPath)) {
+			await this.app.vault.adapter.remove(tempPath);
+		}
+
+		syncDiagnostics.info(`Chunked mobile download started (${this.formatBytes(totalBytes)})`, path);
+		let offset = 0;
+		let firstChunk = true;
+
+		while (offset < totalBytes) {
+			this.throwIfStopped();
+			const end = Math.min(totalBytes - 1, offset + MOBILE_DOWNLOAD_CHUNK_BYTES - 1);
+			const bytesWritten = await this.downloadAndWriteChunk(tempPath, driveId, offset, end, firstChunk);
+			offset += bytesWritten;
+			firstChunk = false;
+
+			const fileName = path.split('/').pop() || path;
+			const pct = Math.min(100, Math.round((offset / totalBytes) * 100));
+			this.updateStatus(
+				`Pulling ${this.stats.processed}/${this.stats.totalFiles} · ${fileName} ${pct}%`,
+				{ currentFile: path, detail: `Downloading ${this.formatBytes(offset)} / ${this.formatBytes(totalBytes)} in low-memory chunks` }
+			);
+
+			// Give the WebView a frame to release the completed response before requesting
+			// the next chunk and let Obsidian remain interactive during long videos.
+			await new Promise<void>(resolve => window.setTimeout(resolve, MOBILE_WORK_YIELD_MS));
+		}
+
+		await this.replaceWithCompletedDownload(tempPath, path);
+		syncDiagnostics.info(`Chunked mobile download completed (${this.formatBytes(totalBytes)})`, path);
+	}
+
+	private async downloadAndWriteChunk(tempPath: string, driveId: string, start: number, end: number, firstChunk: boolean): Promise<number> {
+		const expectedBytes = end - start + 1;
+		const chunk = await this.client.downloadFileRange(driveId, start, end);
+
+		if (chunk.status !== 206) {
+			throw new Error(`Drive did not honor the low-memory byte range request (HTTP ${chunk.status}).`);
+		}
+		if (chunk.content.byteLength !== expectedBytes) {
+			throw new Error(`Drive returned ${chunk.content.byteLength} bytes for a ${expectedBytes}-byte download range.`);
+		}
+
+		if (firstChunk) {
+			await this.app.vault.adapter.writeBinary(tempPath, chunk.content);
+		} else {
+			await this.app.vault.adapter.appendBinary(tempPath, chunk.content);
+		}
+		return chunk.content.byteLength;
+	}
+
+	private async replaceWithCompletedDownload(tempPath: string, path: string) {
+		try {
+			await this.app.vault.adapter.rename(tempPath, path);
+			return;
+		} catch (error) {
+			const tempExists = await this.app.vault.adapter.exists(tempPath);
+			const destinationExists = await this.app.vault.adapter.exists(path);
+			if (!tempExists && destinationExists) return;
+			if (!tempExists || !destinationExists) throw error;
+		}
+
+		// Some adapters do not replace an existing destination during rename. The old
+		// file remains intact until the complete temporary download is ready.
+		await this.app.vault.adapter.remove(path);
+		await this.app.vault.adapter.rename(tempPath, path);
 	}
 
 	private async ensureLocalPath(path: string) {

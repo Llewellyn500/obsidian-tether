@@ -97,7 +97,8 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Tether prevents parallel workers and retrying requests from creating multiple Drive folders for the same vault path.
 - When Tether encounters duplicate same-name folders, it recursively moves their contents into one canonical folder and moves each empty duplicate folder to Drive Trash.
 - Byte-identical duplicate files are moved to Drive Trash. Differing same-name files are both preserved, with the extra copy renamed using a `Tether conflict` suffix.
-- Tether excludes `.git`, `.trash`, `node_modules`, `.venv` / `venv`, `__pycache__`, common build folders (`.next`, `dist`, `build`, `target`), and its own sync state file at `.obsidian/gdrive-sync.json`.
+- Mobile pulls process downloads one at a time, use low-memory byte ranges for large media, yield regularly to Obsidian, release completed Drive listings and file buffers promptly, and reduce full-state rewrites during large batches.
+- Tether excludes `.git`, `.codex-worktrees`, `.trash`, `node_modules`, `.venv` / `venv`, `__pycache__`, common build folders (`.next`, `dist`, `build`, `target`), and its own sync state file at `.obsidian/gdrive-sync.json`.
 
 ## Compatibility
 

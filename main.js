@@ -619,11 +619,11 @@ var GoogleDriveClient = class {
     return copy.buffer;
   }
   async listFiles(folderId) {
-    let files = [];
+    const files = [];
     let pageToken;
     do {
       const page = await this.listFilesPage(folderId, pageToken);
-      files = files.concat(page.files);
+      files.push(...page.files);
       pageToken = page.nextPageToken;
     } while (pageToken);
     return files;
@@ -644,12 +644,21 @@ var GoogleDriveClient = class {
     });
     return response.json;
   }
+  async downloadFileRange(fileId, start, end) {
+    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+    const response = await this.request({
+      url,
+      method: "GET",
+      headers: { "Range": `bytes=${start}-${end}` }
+    });
+    return { content: response.arrayBuffer, status: response.status };
+  }
   async listFolders(parentId = "root") {
-    let files = [];
+    const files = [];
     let pageToken;
     do {
       const page = await this.listFoldersPage(parentId, pageToken);
-      files = files.concat(page.files);
+      files.push(...page.files);
       pageToken = page.nextPageToken;
     } while (pageToken);
     return files;
@@ -1093,13 +1102,43 @@ var RECENT_LOCAL_EDIT_GRACE_MS = 3e4;
 var DRAWING_LOCAL_EDIT_GRACE_MS = 3e4;
 var STATE_SAVE_CHANGE_LIMIT = 40;
 var STATE_SAVE_INTERVAL_MS = 1e4;
+var MOBILE_STATE_SAVE_CHANGE_LIMIT = 120;
+var MOBILE_STATE_SAVE_INTERVAL_MS = 2e4;
 var MANUAL_STATUS_UPDATE_MS = 500;
+var MOBILE_STATUS_UPDATE_MS = 1e3;
 var BACKGROUND_STATUS_UPDATE_MS = 3e3;
 var WORK_YIELD_ITEM_LIMIT = 15;
+var MOBILE_WORK_YIELD_ITEM_LIMIT = 4;
+var MOBILE_WORK_YIELD_MS = 16;
 var CATASTROPHIC_DELETE_RATIO = 0.8;
 var UPLOAD_PROGRESS_DETAIL_BYTES = 256 * 1024;
 var PUSH_PARALLELISM = 3;
 var LARGE_UPLOAD_BYTES = 2 * 1024 * 1024;
+var MOBILE_CHUNKED_DOWNLOAD_BYTES = 4 * 1024 * 1024;
+var MOBILE_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+var PARTIAL_DOWNLOAD_SUFFIX = ".tether-part";
+var EXCLUDED_PATH_SEGMENTS = /* @__PURE__ */ new Set([
+  ".git",
+  ".codex-worktrees",
+  ".trash",
+  "node_modules",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".next",
+  "dist",
+  "build",
+  "target",
+  ".cache",
+  ".turbo",
+  ".parcel-cache",
+  "coverage",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".tox",
+  ".idea",
+  ".vscode"
+]);
 var GOOGLE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
 var SyncStoppedError = class extends Error {
   constructor() {
@@ -1143,7 +1182,9 @@ var SyncEngine = class {
     this.updateStatus("Stopping...", void 0, true);
   }
   updateStatus(text, partialStats, force = false) {
-    this.stats = { ...this.stats, status: text, ...partialStats };
+    this.stats.status = text;
+    if (partialStats)
+      Object.assign(this.stats, partialStats);
     const now = Date.now();
     const shouldRender = force || text === "Idle" || text === "Failed" || now - this.lastStatusUpdateAt >= this.statusUpdateIntervalMs;
     if (!shouldRender)
@@ -1167,7 +1208,7 @@ var SyncEngine = class {
     const previousSilent = this.silent;
     const previousStatusUpdateIntervalMs = this.statusUpdateIntervalMs;
     this.silent = (_a = options.silent) != null ? _a : false;
-    this.statusUpdateIntervalMs = (_b = options.statusUpdateIntervalMs) != null ? _b : this.silent ? BACKGROUND_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS;
+    this.statusUpdateIntervalMs = (_b = options.statusUpdateIntervalMs) != null ? _b : this.silent ? BACKGROUND_STATUS_UPDATE_MS : import_obsidian5.Platform.isMobileApp ? MOBILE_STATUS_UPDATE_MS : MANUAL_STATUS_UPDATE_MS;
     this.lastStatusUpdateAt = 0;
     this.processedSinceYield = 0;
     this.stopRequested = false;
@@ -1230,9 +1271,19 @@ var SyncEngine = class {
     this.stats.processed = 0;
     this.stats.totalFiles = 0;
     this.updateStatus("Pulling changes...");
-    const remotePathSet = /* @__PURE__ */ new Set();
-    await this.processRemoteTree(vaultRootDriveId, remotePathSet);
-    if (remotePathSet.size === 0) {
+    const pendingDeletionPaths = /* @__PURE__ */ new Set();
+    for (const path of Object.keys(this.stateManager.state)) {
+      if (path !== "__VAULT_ROOT__" && !this.isExcluded(path)) {
+        pendingDeletionPaths.add(path);
+      }
+    }
+    const tracker = {
+      seenCount: 0,
+      trackedCount: pendingDeletionPaths.size,
+      pendingDeletionPaths
+    };
+    await this.processRemoteTree(vaultRootDriveId, tracker);
+    if (tracker.seenCount === 0) {
       const msg = "Pull found an empty Drive vault root. No local files were changed. Check the selected Google Drive folder/account, or use Push if this is a new empty Drive setup.";
       console.error(msg);
       new import_obsidian5.Notice(msg);
@@ -1240,7 +1291,7 @@ var SyncEngine = class {
       this.stats.errors.push({ path: "Google Drive vault root", message: msg });
       return;
     }
-    await this.handleRemoteDeletions(remotePathSet);
+    await this.handleRemoteDeletions(tracker);
   }
   async pushToRemote(vaultRootDriveId) {
     this.updateStatus("Scanning local items...");
@@ -1339,31 +1390,12 @@ var SyncEngine = class {
   isExcluded(path) {
     const statePath = this.stateManager.getStatePath();
     const segments = path.split("/");
-    const excludedRoots = /* @__PURE__ */ new Set([
-      ".git",
-      ".trash",
-      "node_modules",
-      ".venv",
-      "venv",
-      "__pycache__",
-      ".next",
-      "dist",
-      "build",
-      "target",
-      ".cache",
-      ".turbo",
-      ".parcel-cache",
-      "coverage",
-      ".pytest_cache",
-      ".mypy_cache",
-      ".tox",
-      ".idea",
-      ".vscode"
-    ]);
     if (path === statePath || path.startsWith(`${statePath}/`))
       return true;
+    if (path.endsWith(PARTIAL_DOWNLOAD_SUFFIX))
+      return true;
     for (const segment of segments) {
-      if (excludedRoots.has(segment))
+      if (EXCLUDED_PATH_SEGMENTS.has(segment))
         return true;
     }
     return false;
@@ -1397,7 +1429,9 @@ var SyncEngine = class {
     return isOpen;
   }
   async flushStateIfNeeded(force = false) {
-    if (force || this.stateManager.shouldSave(STATE_SAVE_CHANGE_LIMIT, STATE_SAVE_INTERVAL_MS)) {
+    const changeLimit = import_obsidian5.Platform.isMobileApp ? MOBILE_STATE_SAVE_CHANGE_LIMIT : STATE_SAVE_CHANGE_LIMIT;
+    const intervalMs = import_obsidian5.Platform.isMobileApp ? MOBILE_STATE_SAVE_INTERVAL_MS : STATE_SAVE_INTERVAL_MS;
+    if (force || this.stateManager.shouldSave(changeLimit, intervalMs)) {
       await this.stateManager.save();
     }
   }
@@ -1405,9 +1439,11 @@ var SyncEngine = class {
     await this.flushStateIfNeeded();
     this.throwIfStopped();
     this.processedSinceYield++;
-    if (this.processedSinceYield >= WORK_YIELD_ITEM_LIMIT) {
+    const yieldItemLimit = import_obsidian5.Platform.isMobileApp ? MOBILE_WORK_YIELD_ITEM_LIMIT : WORK_YIELD_ITEM_LIMIT;
+    if (this.processedSinceYield >= yieldItemLimit) {
       this.processedSinceYield = 0;
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      const delayMs = import_obsidian5.Platform.isMobileApp ? MOBILE_WORK_YIELD_MS : 0;
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       this.throwIfStopped();
     }
   }
@@ -1841,7 +1877,7 @@ Continue only if this matches what you expect.`;
   sameRemoteContent(a, b) {
     return a.mimeType === b.mimeType && !!a.size && !!b.size && a.size === b.size && !!a.md5Checksum && !!b.md5Checksum && a.md5Checksum === b.md5Checksum;
   }
-  async processRemoteTree(folderId, remotePathSet, parentPath = "", depth = 0, locallyDeletedPaths = /* @__PURE__ */ new Set()) {
+  async processRemoteTree(folderId, tracker, parentPath = "", depth = 0, locallyDeletedPaths = /* @__PURE__ */ new Set()) {
     if (depth > 50)
       throw new Error("Maximum folder depth reached.");
     this.throwIfStopped();
@@ -1854,7 +1890,8 @@ Continue only if this matches what you expect.`;
         if (this.isLocallyDeletedPath(path, locallyDeletedPaths)) {
           continue;
         }
-        remotePathSet.add(path);
+        tracker.seenCount++;
+        tracker.pendingDeletionPaths.delete(path);
         if (this.isExcluded(path))
           continue;
         try {
@@ -1878,12 +1915,14 @@ Continue only if this matches what you expect.`;
         this.updateStatus(this.stats.status);
         await this.afterWorkItem();
         if (item.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
-          await this.processRemoteTree(item.id, remotePathSet, path, depth + 1, locallyDeletedPaths);
+          await this.processRemoteTree(item.id, tracker, path, depth + 1, locallyDeletedPaths);
         }
       }
     } catch (error) {
       console.error(`Failed to scan Drive folder ${folderId}`, error);
       throw error;
+    } finally {
+      this.remoteFolderCache.delete(folderId);
     }
   }
   async ensureVaultRoot(name, createIfMissing = true) {
@@ -2086,15 +2125,19 @@ Continue only if this matches what you expect.`;
     }
     return locallyDeletedPaths;
   }
-  async handleRemoteDeletions(remotePathSet) {
-    const stateEntries = Object.entries(this.stateManager.state);
-    const sortedEntries = stateEntries.filter(([path]) => path !== "__VAULT_ROOT__" && !this.isExcluded(path)).sort((a, b) => b[0].length - a[0].length);
-    const deletionCandidates = sortedEntries.filter(([path]) => !remotePathSet.has(path));
-    const trackedCount = sortedEntries.length;
+  async handleRemoteDeletions(tracker) {
+    const deletionCandidates = [];
+    for (const path of tracker.pendingDeletionPaths) {
+      const entry = this.stateManager.get(path);
+      if (entry)
+        deletionCandidates.push([path, entry]);
+    }
+    deletionCandidates.sort((a, b) => b[0].length - a[0].length);
+    const trackedCount = tracker.trackedCount;
     if (deletionCandidates.length === 0)
       return;
-    if (remotePathSet.size === 0 || deletionCandidates.length === trackedCount) {
-      const msg = remotePathSet.size === 0 ? `Pull paused local deletions: the Drive vault root returned no files or folders, but this device has ${trackedCount} tracked local item${trackedCount === 1 ? "" : "s"}. No local files were deleted. Check the selected Google Drive folder/account before pulling again.` : `Pull paused local deletions: every tracked local item is missing from Drive (${trackedCount}/${trackedCount}). No local files were deleted. Check the selected Google Drive folder/account before pulling again.`;
+    if (tracker.seenCount === 0 || deletionCandidates.length === trackedCount) {
+      const msg = tracker.seenCount === 0 ? `Pull paused local deletions: the Drive vault root returned no files or folders, but this device has ${trackedCount} tracked local item${trackedCount === 1 ? "" : "s"}. No local files were deleted. Check the selected Google Drive folder/account before pulling again.` : `Pull paused local deletions: every tracked local item is missing from Drive (${trackedCount}/${trackedCount}). No local files were deleted. Check the selected Google Drive folder/account before pulling again.`;
       console.error(msg);
       new import_obsidian5.Notice(msg);
       this.stats.failed++;
@@ -2155,13 +2198,14 @@ Continue only if this matches what you expect.`;
     }
   }
   async download(path, remoteFile) {
-    const content = await this.client.downloadFile(remoteFile.id);
     const parts = path.split("/");
     if (parts.length > 1) {
       const folderPath = parts.slice(0, -1).join("/");
       await this.ensureLocalPath(folderPath);
     }
-    await this.app.vault.adapter.writeBinary(path, content);
+    const downloaded = await this.downloadAndWrite(path, remoteFile);
+    if (!downloaded)
+      return;
     const stat = await this.safeStat(path);
     this.stateManager.set(path, {
       driveId: remoteFile.id,
@@ -2169,7 +2213,85 @@ Continue only if this matches what you expect.`;
       remoteMtime: remoteFile.modifiedTime,
       etag: ""
     });
-    await this.flushStateIfNeeded();
+    const remoteSize = this.getRemoteFileSize(remoteFile);
+    const wasChunked = import_obsidian5.Platform.isMobileApp && remoteSize !== null && remoteSize > MOBILE_CHUNKED_DOWNLOAD_BYTES;
+    await this.flushStateIfNeeded(wasChunked);
+    this.stats.detail = "";
+  }
+  async downloadAndWrite(path, remoteFile) {
+    const remoteSize = this.getRemoteFileSize(remoteFile);
+    if (import_obsidian5.Platform.isMobileApp && remoteSize !== null && remoteSize > MOBILE_CHUNKED_DOWNLOAD_BYTES) {
+      if (typeof this.app.vault.adapter.appendBinary !== "function") {
+        const reason = `large mobile download (${this.formatBytes(remoteSize)}); update Obsidian to download it safely in chunks`;
+        this.addDeferredFile(path, reason);
+        syncDiagnostics.warn(`Deferred ${reason}`, path);
+        return false;
+      }
+      await this.downloadLargeMobileFile(path, remoteFile.id, remoteSize);
+      return true;
+    }
+    const content = await this.client.downloadFile(remoteFile.id);
+    await this.app.vault.adapter.writeBinary(path, content);
+    return true;
+  }
+  getRemoteFileSize(remoteFile) {
+    if (!remoteFile.size)
+      return null;
+    const size = Number(remoteFile.size);
+    return Number.isFinite(size) && size >= 0 ? size : null;
+  }
+  async downloadLargeMobileFile(path, driveId, totalBytes) {
+    const tempPath = `${path}${PARTIAL_DOWNLOAD_SUFFIX}`;
+    if (await this.app.vault.adapter.exists(tempPath)) {
+      await this.app.vault.adapter.remove(tempPath);
+    }
+    syncDiagnostics.info(`Chunked mobile download started (${this.formatBytes(totalBytes)})`, path);
+    let offset = 0;
+    let firstChunk = true;
+    while (offset < totalBytes) {
+      this.throwIfStopped();
+      const end = Math.min(totalBytes - 1, offset + MOBILE_DOWNLOAD_CHUNK_BYTES - 1);
+      const bytesWritten = await this.downloadAndWriteChunk(tempPath, driveId, offset, end, firstChunk);
+      offset += bytesWritten;
+      firstChunk = false;
+      const fileName = path.split("/").pop() || path;
+      const pct = Math.min(100, Math.round(offset / totalBytes * 100));
+      this.updateStatus(`Pulling ${this.stats.processed}/${this.stats.totalFiles} \xB7 ${fileName} ${pct}%`, { currentFile: path, detail: `Downloading ${this.formatBytes(offset)} / ${this.formatBytes(totalBytes)} in low-memory chunks` });
+      await new Promise((resolve) => window.setTimeout(resolve, MOBILE_WORK_YIELD_MS));
+    }
+    await this.replaceWithCompletedDownload(tempPath, path);
+    syncDiagnostics.info(`Chunked mobile download completed (${this.formatBytes(totalBytes)})`, path);
+  }
+  async downloadAndWriteChunk(tempPath, driveId, start, end, firstChunk) {
+    const expectedBytes = end - start + 1;
+    const chunk = await this.client.downloadFileRange(driveId, start, end);
+    if (chunk.status !== 206) {
+      throw new Error(`Drive did not honor the low-memory byte range request (HTTP ${chunk.status}).`);
+    }
+    if (chunk.content.byteLength !== expectedBytes) {
+      throw new Error(`Drive returned ${chunk.content.byteLength} bytes for a ${expectedBytes}-byte download range.`);
+    }
+    if (firstChunk) {
+      await this.app.vault.adapter.writeBinary(tempPath, chunk.content);
+    } else {
+      await this.app.vault.adapter.appendBinary(tempPath, chunk.content);
+    }
+    return chunk.content.byteLength;
+  }
+  async replaceWithCompletedDownload(tempPath, path) {
+    try {
+      await this.app.vault.adapter.rename(tempPath, path);
+      return;
+    } catch (error) {
+      const tempExists = await this.app.vault.adapter.exists(tempPath);
+      const destinationExists = await this.app.vault.adapter.exists(path);
+      if (!tempExists && destinationExists)
+        return;
+      if (!tempExists || !destinationExists)
+        throw error;
+    }
+    await this.app.vault.adapter.remove(path);
+    await this.app.vault.adapter.rename(tempPath, path);
   }
   async ensureLocalPath(path) {
     if (!path || path === ".")
