@@ -1,7 +1,7 @@
 {
   "id": "tether",
   "name": "Tether",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "minAppVersion": "0.15.0",
   "description": "Sync your vault with Google Drive using your own Google Cloud credentials.",
   "author": "Llewellyn Paintsil",
