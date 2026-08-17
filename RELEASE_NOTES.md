@@ -1,28 +1,26 @@
-Tether 1.0.15 prevents mobile crashes while pulling large vault updates and media files.
+Tether 1.0.16 makes Push mirror the real local vault structure to Google Drive, including cleanup of older cloud items that were missing from local sync state.
 
 ## What changed
 
-- Large files on mobile are downloaded in 2 MB byte ranges instead of loading the entire file into Obsidian's WebView memory.
-- Chunked downloads are assembled in an excluded `.tether-part` file and moved into place only after the complete file arrives.
-- Completed chunked files are saved to sync state immediately so an interrupted pull does not repeat expensive work.
-- Older Obsidian versions without binary append support defer large files safely instead of risking an app crash.
-- Mobile pulls yield to the app more frequently, render status less often, and reduce full sync-state rewrites.
-- Completed Drive folder listings and download buffers are released earlier, and pull deletion tracking no longer keeps a second copy of every remote path.
-- `.codex-worktrees` and incomplete `.tether-part` files are excluded from synchronization.
+- Push now inventories the complete Drive vault instead of checking only paths recorded in `.obsidian/gdrive-sync.json`.
+- Cloud files and folders that no longer exist locally are removed even when they were never tracked, fixing stale folders after a vault restructure.
+- Unchanged local files are verified against the expected Drive path so missing or moved remote copies are recreated correctly.
+- Stale cloud branches are removed only after local uploads finish successfully.
+- Deleting a stale folder uses one Drive operation for the folder branch instead of issuing redundant requests for every descendant.
 
 ## Safety
 
-- Downloads remain sequential on mobile, keeping only one 2 MB response chunk in active plugin memory at a time.
-- Existing destination files stay intact until a replacement has downloaded completely.
-- Google Drive must return the exact requested byte range; unexpected or incomplete responses fail safely.
-- The existing duplicate-folder prevention and repair behavior from 1.0.14 remains included.
+- An empty local vault scan never triggers remote deletion.
+- A manual push asks for confirmation when 80% or more of existing Drive items would be deleted, allowing an intentional full restructure to proceed.
+- Background push pauses large deletion batches instead of confirming them automatically.
+- Remote cleanup is skipped when any local upload fails.
+- Existing exclusions such as `.git`, `.codex-worktrees`, `node_modules`, build folders, partial downloads, and Tether's sync-state file remain protected.
 
 ## Validation
 
-- Confirmed the fix on the affected mobile pull containing a large `.mov` attachment.
-- Added regression coverage for Google Drive byte-range requests.
-- All seven sync regression tests pass.
+- Added regression coverage for untracked stale Drive folders and complete local restructures.
+- All nine sync regression tests pass.
 - The production Obsidian bundle builds successfully.
 - GitHub Actions rebuilds and attests `main.js`, `manifest.json`, and `styles.css` before publishing them.
 
-**Full changelog:** https://github.com/Llewellyn500/obsidian-tether/compare/1.0.14...1.0.15
+**Full changelog:** https://github.com/Llewellyn500/obsidian-tether/compare/1.0.15...1.0.16
