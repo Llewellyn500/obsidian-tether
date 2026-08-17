@@ -70,6 +70,11 @@ interface RemoteScanTracker {
 	pendingDeletionPaths: Set<string>;
 }
 
+interface RemoteMirrorItem {
+	path: string;
+	file: DriveFile;
+}
+
 export class SyncEngine {
 	app: App;
 	client: GoogleDriveClient;
@@ -264,7 +269,9 @@ export class SyncEngine {
 		this.stats.totalFiles = localPathSet.size;
 		this.throwIfStopped();
 
-		await this.handleLocalDeletions(localPathSet);
+		this.updateStatus('Scanning Drive items...');
+		const remoteItems = await this.collectRemoteMirrorItems(vaultRootDriveId);
+		const deletionCandidates = this.prepareRemoteMirrorDeletions(localPathSet, remoteItems);
 		this.throwIfStopped();
 
 		this.updateStatus('Pushing changes...', undefined, true);
@@ -320,6 +327,14 @@ export class SyncEngine {
 			if (result.status === 'rejected') {
 				throw result.reason;
 			}
+		}
+
+		if (this.stats.failed === 0 && deletionCandidates.length > 0) {
+			await this.deleteRemoteMirrorItems(deletionCandidates, remoteItems);
+		} else if (this.stats.failed > 0 && deletionCandidates.length > 0) {
+			const msg = `Push skipped ${deletionCandidates.length} remote deletion${deletionCandidates.length === 1 ? '' : 's'} because one or more local items failed to upload.`;
+			console.error(msg);
+			this.stats.errors.push({ path: 'Remote deletions', message: msg });
 		}
 	}
 
@@ -483,7 +498,7 @@ export class SyncEngine {
 		const staleDeviceNote = mode === 'pull'
 			? '\n\nThis can be normal when this device has not pulled changes for a while and the other device moved or deleted many files.'
 			: '';
-		const msg = `${mode === 'pull' ? 'Pull' : 'Push'} wants to delete ${count} of ${trackedCount} tracked ${target} files (${percent}%) because they are missing from ${source}.${staleDeviceNote}\n\nContinue only if this matches what you expect.`;
+		const msg = `${mode === 'pull' ? 'Pull' : 'Push'} wants to delete ${count} of ${trackedCount} ${target} items (${percent}%) because they are missing from ${source}.${staleDeviceNote}\n\nContinue only if this matches what you expect.`;
 
 		if (this.silent) {
 			return false;
@@ -551,47 +566,18 @@ export class SyncEngine {
 		const parentPath = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
 		const driveParentId = await this.ensureRemotePathByPath(parentPath, vaultRootId);
 		let state = this.stateManager.get(path);
-		if (state && stat.mtime <= state.lastSyncedMtime) {
-			return;
-		}
-
-		// Known Drive ID: update directly (no folder listing). Saves a lot of API + RAM on large vaults.
-		if (state?.driveId && stat.mtime > state.lastSyncedMtime) {
-			let updated = false;
-			await this.withLargeUploadGate(stat.size, async () => {
-				const upload = await this.readStableLocalFile(path, stat);
-				if (!upload) {
-					updated = true;
-					return;
-				}
-				try {
-					const onProgress = this.createUploadProgressHandler(path);
-					const remoteFile = await this.client.updateFile(state!.driveId, upload.content, mimeType, onProgress);
-					this.updateCachedRemoteFile(driveParentId, remoteFile);
-					this.stateManager.set(path, {
-						...state!,
-						lastSyncedMtime: upload.stat.mtime,
-						remoteMtime: remoteFile.modifiedTime
-					});
-					await this.deferIfChangedAfterUpload(path, upload.stat);
-					await this.flushStateIfNeeded();
-					updated = true;
-				} catch (e) {
-					if (!this.isNotFound(e)) throw e;
-					this.stateManager.remove(path);
-					state = undefined;
-				}
-			});
-			if (updated) return;
-		}
-
 		const existingRemote = await this.findRemoteFileByName(driveParentId, parentPath, fileName);
 
-		if (state && existingRemote && state.driveId !== existingRemote.id) {
-			state = { ...state, driveId: existingRemote.id, remoteMtime: existingRemote.modifiedTime };
-			this.stateManager.set(path, state);
+		// Push is authoritative. A state entry is only valid when its Drive ID still exists
+		// at the same path; otherwise recreate/update the expected remote item even when the
+		// local mtime has not changed since the previous sync.
+		if (state && (!existingRemote || state.driveId !== existingRemote.id)) {
+			this.stateManager.remove(path);
+			state = undefined;
 			await this.flushStateIfNeeded();
 		}
+
+		if (state && stat.mtime <= state.lastSyncedMtime) return;
 
 		if (!state) {
 			await this.withLargeUploadGate(stat.size, async () => {
@@ -1170,77 +1156,108 @@ export class SyncEngine {
 		}
 	}
 
-	private async handleLocalDeletions(localPathSet: Set<string>): Promise<Set<string>> {
+	private async collectRemoteMirrorItems(folderId: string, parentPath: string = '', depth: number = 0, items: RemoteMirrorItem[] = []): Promise<RemoteMirrorItem[]> {
+		if (depth > 50) throw new Error('Maximum folder depth reached.');
+		this.throwIfStopped();
+
+		const children = await this.listCanonicalRemoteItems(folderId, parentPath);
+		for (const child of children) {
+			this.throwIfStopped();
+			const path = parentPath ? `${parentPath}/${child.name}` : child.name;
+			items.push({ path, file: child });
+
+			if (child.mimeType === GOOGLE_FOLDER_MIME_TYPE && !this.isExcluded(path)) {
+				await this.collectRemoteMirrorItems(child.id, path, depth + 1, items);
+			}
+			await this.afterWorkItem();
+		}
+
+		return items;
+	}
+
+	private prepareRemoteMirrorDeletions(localPathSet: Set<string>, remoteItems: RemoteMirrorItem[]): RemoteMirrorItem[] {
 		this.updateStatus('Checking for deletions...');
 		this.throwIfStopped();
-		const stateEntries = Object.entries(this.stateManager.state);
-		const locallyDeletedPaths = new Set<string>();
 
-		// Collect candidates for deletion first
-		const deletionCandidates: [string, typeof stateEntries[0][1]][] = [];
-		const trackedCount = stateEntries.filter(([p]) => p !== '__VAULT_ROOT__' && !this.isExcluded(p)).length;
+		const localPaths = new Set(Array.from(localPathSet, path => path.toLowerCase()));
+		const comparableRemoteItems = remoteItems.filter(item => !this.isExcluded(item.path));
+		const staleItems = comparableRemoteItems.filter(item => !localPaths.has(item.path.toLowerCase()));
+		if (staleItems.length === 0) return [];
 
-		for (const [path, entry] of stateEntries) {
-			if (path === '__VAULT_ROOT__' || this.isExcluded(path)) continue;
-			if (!localPathSet.has(path)) {
-				deletionCandidates.push([path, entry]);
-			}
-		}
-
-		// Safeguard: abort if deleting too many remote files at once
-		if (deletionCandidates.length === 0) {
-			return locallyDeletedPaths;
-		}
-
-		if (localPathSet.size === 0 || deletionCandidates.length === trackedCount) {
-			const msg = localPathSet.size === 0
-				? `Push paused remote deletions: this device returned no local files or folders, but Drive has ${trackedCount} tracked item${trackedCount === 1 ? '' : 's'}. No remote files were deleted.`
-				: `Push paused remote deletions: every tracked remote item is missing locally (${trackedCount}/${trackedCount}). No remote files were deleted. Check this vault before pushing again.`;
+		if (localPathSet.size === 0) {
+			const remoteCount = comparableRemoteItems.length;
+			const msg = `Push paused remote deletions: this device returned no local files or folders, but Drive has ${remoteCount} item${remoteCount === 1 ? '' : 's'}. No remote files were deleted.`;
 			console.error(msg);
 			new Notice(msg);
 			this.stats.failed++;
 			this.stats.errors.push({ path: 'Remote deletions', message: msg });
-			return locallyDeletedPaths;
+			return [];
 		}
 
-		if (trackedCount > 0 && deletionCandidates.length / trackedCount >= CATASTROPHIC_DELETE_RATIO) {
-			if (!this.shouldProceedWithLargeDeletion('push', deletionCandidates.length, trackedCount)) {
-				const msg = `Push paused remote deletions: would delete ${deletionCandidates.length} of ${trackedCount} remote files (>=${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
+		const remoteCount = comparableRemoteItems.length;
+		if (remoteCount > 0 && staleItems.length / remoteCount >= CATASTROPHIC_DELETE_RATIO) {
+			if (!this.shouldProceedWithLargeDeletion('push', staleItems.length, remoteCount)) {
+				const msg = `Push paused remote deletions: would delete ${staleItems.length} of ${remoteCount} remote items (>=${Math.round(CATASTROPHIC_DELETE_RATIO * 100)}%). No remote files were deleted.`;
 				console.error(msg);
 				new Notice(msg);
 				this.stats.failed++;
 				this.stats.errors.push({ path: 'Remote deletions', message: msg });
-				return locallyDeletedPaths;
+				return [];
 			}
 
-			new Notice(`Confirmed large push deletion batch: deleting ${deletionCandidates.length} remote files.`);
+			new Notice(`Confirmed large push deletion batch: deleting ${staleItems.length} remote items.`);
 		}
 
-		for (const [path, entry] of deletionCandidates) {
+		// Deleting a stale folder also deletes its stale descendants. Keep only the
+		// highest stale path in each branch so Drive receives one request per branch.
+		const stalePaths = new Set(staleItems.map(item => item.path.toLowerCase()));
+		return staleItems
+			.filter(item => {
+				const parts = item.path.toLowerCase().split('/');
+				for (let i = 1; i < parts.length; i++) {
+					if (stalePaths.has(parts.slice(0, i).join('/'))) return false;
+				}
+				return true;
+			})
+			.sort((a, b) => a.path.localeCompare(b.path));
+	}
+
+	private async deleteRemoteMirrorItems(deletionRoots: RemoteMirrorItem[], remoteItems: RemoteMirrorItem[]) {
+		for (const root of deletionRoots) {
 			this.throwIfStopped();
+			const deletedItems = remoteItems.filter(item => this.isSameOrChildPath(item.path.toLowerCase(), root.path.toLowerCase()));
+			const deletedDriveIds = new Set(deletedItems.map(item => item.file.id));
+
 			try {
-				this.updateStatus(`Deleting remote: ${path}`);
-				await this.client.deleteFile(entry.driveId);
-				this.stateManager.remove(path);
-				locallyDeletedPaths.add(path);
+				this.updateStatus(`Deleting remote: ${root.path}`);
+				await this.client.deleteFile(root.file.id);
+				this.removeDeletedRemoteState(root.path, deletedDriveIds);
 				await this.flushStateIfNeeded();
 			} catch (e) {
 				if (isSessionExpiredError(e)) throw e;
 				if (this.isNotFound(e)) {
-					this.stateManager.remove(path);
-					locallyDeletedPaths.add(path);
+					this.removeDeletedRemoteState(root.path, deletedDriveIds);
 					await this.flushStateIfNeeded();
 				} else {
-					console.error(`Failed to delete remote ${path}`, e);
+					console.error(`Failed to delete remote ${root.path}`, e);
 					this.stats.failed++;
-					this.stats.errors.push({ path, message: this.getErrorMessage(e) });
+					this.stats.errors.push({ path: root.path, message: this.getErrorMessage(e) });
 				}
 			}
 
 			await this.afterWorkItem();
 		}
+	}
 
-		return locallyDeletedPaths;
+	private removeDeletedRemoteState(rootPath: string, deletedDriveIds: Set<string>) {
+		const normalizedRoot = rootPath.toLowerCase();
+		for (const [path, entry] of Object.entries(this.stateManager.state)) {
+			if (path === '__VAULT_ROOT__') continue;
+			const normalizedPath = path.toLowerCase();
+			if (this.isSameOrChildPath(normalizedPath, normalizedRoot) || deletedDriveIds.has(entry.driveId)) {
+				this.stateManager.remove(path);
+			}
+		}
 	}
 
 	private async handleRemoteDeletions(tracker: RemoteScanTracker) {

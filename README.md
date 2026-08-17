@@ -90,9 +90,9 @@ If you already have Tether working on another device, the easiest iOS setup is t
 - Stop Auto Sync pauses startup and interval syncing; manual Pull and Push remain available.
 - Pull replaces local files with the Google Drive version, while deferring open or recently edited local files.
 - If a previous pull saved an empty duplicate Drive vault root, Pull looks for a non-empty matching vault folder and switches back to it before downloading.
-- Pull mirrors remote deletions locally; push mirrors local deletions to Google Drive.
-- Pull now refuses to delete the local vault when the Drive vault root looks empty or completely mismatched. Push also refuses to delete every tracked remote item when the local vault looks empty or completely mismatched.
-- If a startup/manual pull or manual push would delete most tracked files, Tether asks for confirmation before continuing. Background sync still pauses large deletion batches.
+- Pull mirrors remote deletions locally. Push inventories the actual Drive vault and removes non-excluded cloud items that no longer exist locally, including older items missing from the local sync-state file.
+- Pull refuses to delete the local vault when the Drive vault root looks empty or completely mismatched. Push refuses remote deletion when the local vault scan is empty.
+- If a startup/manual pull or manual push would delete most existing items, Tether asks for confirmation before continuing. This lets a confirmed manual push mirror a complete local restructure; background sync still pauses large deletion batches.
 - Push updates existing Google Drive files so Drive keeps revisions instead of creating duplicate sibling files.
 - Tether prevents parallel workers and retrying requests from creating multiple Drive folders for the same vault path.
 - When Tether encounters duplicate same-name folders, it recursively moves their contents into one canonical folder and moves each empty duplicate folder to Drive Trash.

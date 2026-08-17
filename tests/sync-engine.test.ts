@@ -5,6 +5,7 @@ import { DriveFile, GoogleDriveApiError, GoogleDriveClient } from '../sync/gdriv
 import { StateManager } from '../sync/state';
 
 const FOLDER = 'application/vnd.google-apps.folder';
+(globalThis as any).window = { confirm: () => true, setTimeout };
 
 interface StoredItem extends DriveFile {
 	parentId: string;
@@ -26,6 +27,10 @@ class FakeState {
 
 	remove(path: string) {
 		delete this.state[path];
+	}
+
+	getStatePath() {
+		return '.obsidian/gdrive-sync.json';
 	}
 
 	shouldSave() {
@@ -103,7 +108,14 @@ class FakeDrive {
 
 	async deleteFile(id: string): Promise<void> {
 		this.deleteCalls.push(id);
-		throw new Error(`Unexpected permanent delete of ${id}`);
+		const removeTree = (itemId: string) => {
+			for (const child of this.activeChildren(itemId)) {
+				removeTree(child.id);
+			}
+			this.items.delete(itemId);
+		};
+		this.required(id);
+		removeTree(id);
 	}
 
 	async updateFile(id: string): Promise<DriveFile> {
@@ -173,6 +185,9 @@ function makeEngine(drive: FakeDrive, state = new FakeState()) {
 		engine: engine as unknown as {
 			ensureRemotePathByPath(path: string, rootId: string): Promise<string>;
 			listCanonicalRemoteItems(folderId: string, parentPath: string): Promise<DriveFile[]>;
+			collectRemoteMirrorItems(folderId: string): Promise<Array<{ path: string, file: DriveFile }>>;
+			prepareRemoteMirrorDeletions(localPaths: Set<string>, remoteItems: Array<{ path: string, file: DriveFile }>): Array<{ path: string, file: DriveFile }>;
+			deleteRemoteMirrorItems(deletionRoots: Array<{ path: string, file: DriveFile }>, remoteItems: Array<{ path: string, file: DriveFile }>): Promise<void>;
 		},
 		state
 	};
@@ -249,6 +264,34 @@ test('differing same-name files survive folder merge and later rediscovery', asy
 	assert.deepEqual(drive.activeChildren('docs-old').map(item => item.id).sort(), ['same-new', 'same-old']);
 	assert.equal(drive.updateCalls.length, 0);
 	assert.equal(drive.deleteCalls.length, 0);
+});
+
+test('push mirror deletes stale Drive folders even when they were never tracked in local state', async () => {
+	const drive = new FakeDrive();
+	drive.add(file('keep', 'keep.md', 'root', 'keep'));
+	drive.add(folder('old-folder', 'Old Structure', 'root', 1));
+	drive.add(file('old-file', 'forgotten.md', 'old-folder', 'old'));
+
+	const { engine } = makeEngine(drive);
+	const remoteItems = await engine.collectRemoteMirrorItems('root');
+	const deletionRoots = engine.prepareRemoteMirrorDeletions(new Set(['keep.md']), remoteItems);
+	await engine.deleteRemoteMirrorItems(deletionRoots, remoteItems);
+
+	assert.deepEqual(deletionRoots.map(item => item.path), ['Old Structure']);
+	assert.deepEqual(drive.deleteCalls, ['old-folder']);
+	assert.deepEqual(drive.activeChildren('root').map(item => item.name), ['keep.md']);
+});
+
+test('manual push can confirm a completely restructured local vault', async () => {
+	const drive = new FakeDrive();
+	drive.add(folder('old-folder', 'Old', 'root', 1));
+	drive.add(file('old-file', 'old.md', 'old-folder', 'old'));
+
+	const { engine } = makeEngine(drive);
+	const remoteItems = await engine.collectRemoteMirrorItems('root');
+	const deletionRoots = engine.prepareRemoteMirrorDeletions(new Set(['New', 'New/new.md']), remoteItems);
+
+	assert.deepEqual(deletionRoots.map(item => item.path), ['Old']);
 });
 
 test('folder creation retries reuse one pre-generated Drive ID', async () => {
