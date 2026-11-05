@@ -81,6 +81,16 @@ If you already have Tether working on another device, the easiest iOS setup is t
 
 ## Sync behavior
 
+### Handwriting by Alan
+
+Tether includes the hidden `.handwriting` folder and its JSON files in vault sync. Keep the note's `handwriting-page-id` property intact: it links the note to its ink.
+
+In the Markdown editor, Tether preserves the text width and font size recorded by most of the note's anchored strokes. This keeps Handwriting's line anchors usable when a phone note opens on a wider desktop. Handwritten notes can therefore have a narrower text column than ordinary notes. Custom ink folders configured in Handwriting are supported.
+
+This is an editor layout workaround, not a conversion of the ink. It leaves stroke coordinates unchanged. Reading mode uses Handwriting's separate renderer and is not covered. Notes with mixed writing layouts, different fonts/themes, or unanchored older ink may still need adjustment. Use the editor for the verified alignment behavior, and keep matching themes/fonts across devices.
+
+### General behavior
+
 - Tether syncs Markdown notes, attachments, nested folders, and the `.obsidian` folder.
 - Tether creates a dedicated vault folder inside the Google Drive folder you select.
 - Initial setup pushes your local vault into the selected Google Drive folder.

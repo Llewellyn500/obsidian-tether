@@ -3,6 +3,7 @@ import test from 'node:test';
 import { SyncEngine } from '../sync/engine';
 import { DriveFile, GoogleDriveApiError, GoogleDriveClient } from '../sync/gdrive';
 import { StateManager } from '../sync/state';
+import { handwritingLayout } from '../sync/handwriting-layout';
 
 const FOLDER = 'application/vnd.google-apps.folder';
 (globalThis as any).window = { confirm: () => true, setTimeout };
@@ -428,4 +429,32 @@ test('state saves serialize and finish with the newest snapshot on disk', async 
 	assert.equal(JSON.parse(committedWrites[0])['second.md'], undefined);
 	assert.equal(JSON.parse(committedWrites[1])['second.md'].driveId, 'second');
 	assert.equal(state.hasUnsavedChanges(), false);
+});
+test('handwriting keeps the dominant writing layout and rejects invalid sidecars', () => {
+	const anchor = (width: number, fontPx: number) => ({ lineAnchor: { width, fontPx } });
+	assert.deepEqual(handwritingLayout({ surface: 'inline', strokes: [anchor(355, 13.6), anchor(700, 16), anchor(355, 13.6)] }), { width: 355, fontPx: 13.6 });
+	assert.equal(handwritingLayout({ surface: 'pdf', strokes: [anchor(355, 13.6)] }), null);
+	assert.equal(handwritingLayout({ surface: 'inline', strokes: [anchor(NaN, 16), anchor(355, Infinity), null, {}] }), null);
+	assert.equal(handwritingLayout(null), null);
+});
+
+test('hidden handwriting files are inventoried and transferred without changing coordinates', async () => {
+	const { engine } = makeEngine(new FakeDrive());
+	const subject = engine as any;
+	const path = '.handwriting/page-id.json';
+	const bytes = new TextEncoder().encode(JSON.stringify({ surface: 'inline', strokes: [{ pts: [110.29, 2054.6, 0.084, 0], lineAnchor: { line: 31, top: 2022.64, width: 355, fontPx: 13.6 } }] })).buffer;
+	const stat = { type: 'file', mtime: 100, size: bytes.byteLength };
+	const writes = new Map<string, ArrayBuffer>();
+	subject.app.vault = { adapter: {
+		list: async (folder: string) => folder === '' ? { files: [], folders: ['.handwriting'] } : { files: [path], folders: [] },
+		stat: async () => stat,
+		readBinary: async () => bytes,
+		writeBinary: async (name: string, data: ArrayBuffer) => { writes.set(name, data); }
+	} };
+	const paths = await subject.collectLocalPathSet('');
+	assert.ok(paths.has(path));
+	const upload = await subject.readStableLocalFile(path, stat);
+	subject.client.downloadFile = async () => upload.content;
+	await subject.downloadAndWrite(path, { id: 'ink', size: String(bytes.byteLength) });
+	assert.deepEqual(new Uint8Array(writes.get(path)!), new Uint8Array(bytes));
 });

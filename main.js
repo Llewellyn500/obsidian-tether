@@ -31,7 +31,7 @@ var main_exports = {};
 __export(main_exports, {
   default: () => GoogleDriveSyncPlugin
 });
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // sync/state.ts
 var import_obsidian = require("obsidian");
@@ -2689,6 +2689,138 @@ var SetupGuideModal = class extends import_obsidian7.Modal {
   }
 };
 
+// sync/handwriting-layout.ts
+var import_obsidian8 = require("obsidian");
+function handwritingLayout(data) {
+  var _a, _b;
+  const page = data;
+  if (!page || page.surface !== "inline" || !Array.isArray(page.strokes))
+    return null;
+  const groups = /* @__PURE__ */ new Map();
+  for (const stroke of page.strokes) {
+    const a = stroke == null ? void 0 : stroke.lineAnchor;
+    if (!a || !Number.isFinite(a.width) || a.width < 100 || a.width > 1e4 || !Number.isFinite(a.fontPx) || a.fontPx < 6 || a.fontPx > 100)
+      continue;
+    const layout = { width: a.width, fontPx: a.fontPx };
+    const key = `${layout.width}:${layout.fontPx}`;
+    const group = groups.get(key);
+    if (group)
+      group.count++;
+    else
+      groups.set(key, { layout, count: 1 });
+  }
+  return (_b = (_a = [...groups.values()].sort((a, b) => b.count - a.count)[0]) == null ? void 0 : _a.layout) != null ? _b : null;
+}
+var HandwritingLayoutSupport = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.running = false;
+    this.disposed = false;
+    this.styles = /* @__PURE__ */ new Map();
+    this.nextId = 0;
+  }
+  start() {
+    this.plugin.app.workspace.onLayoutReady(() => {
+      void this.refresh();
+    });
+    this.plugin.registerEvent(this.plugin.app.workspace.on("layout-change", () => {
+      void this.refresh();
+    }));
+    this.plugin.registerEvent(this.plugin.app.workspace.on("file-open", () => {
+      void this.refresh();
+    }));
+    this.plugin.registerInterval(window.setInterval(() => {
+      void this.refresh();
+    }, 2e3));
+    this.plugin.register(() => {
+      this.disposed = true;
+      for (const [el, entry] of this.styles) {
+        entry.style.remove();
+        el.removeAttribute("data-tether-handwriting");
+      }
+      this.styles.clear();
+    });
+  }
+  async refresh() {
+    var _a, _b, _c;
+    if (this.running || this.disposed)
+      return;
+    this.running = true;
+    try {
+      const { app } = this.plugin;
+      const live = /* @__PURE__ */ new Set();
+      for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+        if (!(leaf.view instanceof import_obsidian8.MarkdownView) || !leaf.view.file)
+          continue;
+        const view = leaf.view;
+        const file = view.file;
+        const el = view.contentEl;
+        live.add(el);
+        const pageId = (_b = (_a = app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter) == null ? void 0 : _b["handwriting-page-id"];
+        if (typeof pageId !== "string" || !/^[a-zA-Z0-9-]+$/.test(pageId)) {
+          this.clear(el);
+          continue;
+        }
+        let layout = null;
+        try {
+          const settings = JSON.parse(await app.vault.adapter.read((0, import_obsidian8.normalizePath)(`${app.vault.configDir || ".obsidian"}/plugins/handwriting/data.json`)).catch(() => "{}"));
+          const folder = typeof settings.inkFolder === "string" ? settings.inkFolder : ".handwriting";
+          if (folder.split(/[\\/]/).includes("..") || folder.startsWith("/") || folder.includes(":"))
+            continue;
+          const page = JSON.parse(await app.vault.adapter.read((0, import_obsidian8.normalizePath)(`${folder}/${pageId}.json`)));
+          layout = handwritingLayout(page);
+        } catch (e) {
+          continue;
+        }
+        if (this.disposed)
+          return;
+        if (view.file !== file)
+          continue;
+        if (!layout) {
+          this.clear(el);
+          continue;
+        }
+        const key = `${file.path}:${layout.width}:${layout.fontPx}`;
+        if (((_c = this.styles.get(el)) == null ? void 0 : _c.key) === key)
+          continue;
+        this.clear(el);
+        const id = `ink-${++this.nextId}`;
+        el.setAttribute("data-tether-handwriting", id);
+        const style = el.ownerDocument.createElement("style");
+        const selector = `[data-tether-handwriting="${id}"]`;
+        style.textContent = `
+${selector} .markdown-source-view {
+ --file-line-width: ${layout.width}px;
+ --font-text-size: ${layout.fontPx}px;
+ font-size: ${layout.fontPx}px !important;
+}
+${selector} .cm-content {
+ width: ${layout.width}px !important;
+ min-width: ${layout.width}px !important;
+ max-width: ${layout.width}px !important;
+}
+${selector} .cm-content { font-size: ${layout.fontPx}px !important; }
+`;
+        el.ownerDocument.head.appendChild(style);
+        this.styles.set(el, { style, key });
+      }
+      for (const el of this.styles.keys())
+        if (!live.has(el))
+          this.clear(el);
+    } catch (error) {
+      console.warn("Tether: could not refresh handwriting layout", error);
+    } finally {
+      this.running = false;
+    }
+  }
+  clear(el) {
+    var _a;
+    (_a = this.styles.get(el)) == null ? void 0 : _a.style.remove();
+    this.styles.delete(el);
+    el.removeAttribute("data-tether-handwriting");
+  }
+};
+
 // main.ts
 var STARTUP_PULL_DELAY_MS = 5e3;
 var BACKGROUND_SYNC_IDLE_DELAY_MS = 6e4;
@@ -2711,7 +2843,7 @@ var DEFAULT_SETTINGS = {
   initialPullComplete: false,
   lastPluginVersion: ""
 };
-var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
+var GoogleDriveSyncPlugin = class extends import_obsidian9.Plugin {
   constructor() {
     super(...arguments);
     this.isSyncing = false;
@@ -2723,6 +2855,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   }
   async onload() {
     await this.loadSettings();
+    new HandwritingLayoutSupport(this).start();
     this.registerView(VIEW_TYPE_SYNC_STATUS, (leaf) => new SyncStatusView(leaf));
     this.statusBarItem = this.addStatusBarItem();
     this.statusBarItem.setText("GDrive: Idle");
@@ -2851,7 +2984,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
     await this.saveData(this.settings);
     if (folderChanged) {
-      new import_obsidian8.Notice("Sync folder changed. Resetting local sync state...");
+      new import_obsidian9.Notice("Sync folder changed. Resetting local sync state...");
       const statePath = (_d = (_c = (_b = this.stateManager) == null ? void 0 : _b.getStatePath) == null ? void 0 : _c.call(_b)) != null ? _d : `${this.app.vault.configDir || ".obsidian"}/gdrive-sync.json`;
       await this.app.vault.adapter.remove(statePath).catch(() => {
       });
@@ -2883,7 +3016,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   async ensureValidSession(showNotice = true) {
     if (!this.settings.accessToken) {
       if (showNotice) {
-        new import_obsidian8.Notice("Please log in to Google Drive first in settings.");
+        new import_obsidian9.Notice("Please log in to Google Drive first in settings.");
       }
       return false;
     }
@@ -2906,7 +3039,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       } else {
         console.error("Session refresh failed", error);
         if (showNotice) {
-          new import_obsidian8.Notice("Could not refresh Google session: " + (error instanceof Error ? error.message : String(error)));
+          new import_obsidian9.Notice("Could not refresh Google session: " + (error instanceof Error ? error.message : String(error)));
         }
       }
       return false;
@@ -2928,7 +3061,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       }, true);
     }
     if (showNotice) {
-      new import_obsidian8.Notice("Google session expired. Please log in again in Tether settings.");
+      new import_obsidian9.Notice("Google session expired. Please log in again in Tether settings.");
     }
   }
   async manualSync() {
@@ -2952,7 +3085,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.syncEngine.updateStatus("Auto sync stopped", { currentFile: "" }, true);
     }
     this.refreshStatusViews();
-    new import_obsidian8.Notice(wasSyncing ? "Tether auto sync stopped. Current sync is stopping..." : "Tether auto sync stopped.");
+    new import_obsidian9.Notice(wasSyncing ? "Tether auto sync stopped. Current sync is stopping..." : "Tether auto sync stopped.");
   }
   async resumeAutomaticSync() {
     this.settings.syncPaused = false;
@@ -2962,20 +3095,20 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
     this.refreshAutomaticSyncTimers(this.settings.syncOnStartup && !this.startupPullRanThisSession);
     this.refreshStatusViews();
-    new import_obsidian8.Notice("Tether auto sync resumed.");
+    new import_obsidian9.Notice("Tether auto sync resumed.");
   }
   async runSync(mode, options = {}) {
     var _a, _b;
     if (this.isSyncing) {
-      new import_obsidian8.Notice("Sync is already in progress.");
+      new import_obsidian9.Notice("Sync is already in progress.");
       return;
     }
     if (!this.settings.accessToken) {
-      new import_obsidian8.Notice("Please log in to Google Drive first in settings.");
+      new import_obsidian9.Notice("Please log in to Google Drive first in settings.");
       return;
     }
     if (!this.settings.folderId) {
-      new import_obsidian8.Notice("Please select a Google Drive folder in settings.");
+      new import_obsidian9.Notice("Please select a Google Drive folder in settings.");
       return;
     }
     if (!await this.ensureValidSession(!options.silent)) {
@@ -2987,7 +3120,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
     this.setupSyncEngine();
     if (!options.silent && ((_b = options.showStartNotice) != null ? _b : true)) {
-      new import_obsidian8.Notice(`Starting Tether ${mode}...`);
+      new import_obsidian9.Notice(`Starting Tether ${mode}...`);
     }
     try {
       await this.syncEngine.sync({ mode, silent: options.silent });
@@ -3008,13 +3141,13 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       if (error instanceof SyncStoppedError) {
         this.syncEngine.updateStatus("Stopped", { currentFile: "" }, true);
         if (!options.silent) {
-          new import_obsidian8.Notice("Sync stopped.");
+          new import_obsidian9.Notice("Sync stopped.");
         }
       } else if (isSessionExpiredError(error)) {
         await this.handleExpiredSession(true);
       } else if (!options.silent) {
         console.error(`${mode} failed`, error);
-        new import_obsidian8.Notice(`${mode === "pull" ? "Pull" : "Push"} failed: ${error instanceof Error ? error.message : String(error)}`);
+        new import_obsidian9.Notice(`${mode === "pull" ? "Pull" : "Push"} failed: ${error instanceof Error ? error.message : String(error)}`);
       } else {
         console.error(`${mode} failed`, error);
       }
@@ -3044,7 +3177,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       this.startupPullTimeoutId = null;
       if (this.settings.syncPaused)
         return;
-      new import_obsidian8.Notice(pluginVersionChanged ? "Google Drive: Pulling changes after plugin update..." : "Google Drive: Pulling startup changes...");
+      new import_obsidian9.Notice(pluginVersionChanged ? "Google Drive: Pulling changes after plugin update..." : "Google Drive: Pulling startup changes...");
       try {
         await this.startupPullSync();
       } finally {
@@ -3096,7 +3229,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
   }
   async startLogin() {
     if (!this.settings.clientId || !this.settings.clientSecret) {
-      new import_obsidian8.Notice("Add your Google client ID and secret before opening the login page.");
+      new import_obsidian9.Notice("Add your Google client ID and secret before opening the login page.");
       return;
     }
     const verifier = await OAuthManager.generateCodeVerifier();
@@ -3112,7 +3245,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
         await navigator.clipboard.writeText(url).catch(() => {
         });
       }
-      new import_obsidian8.Notice("Login page could not open automatically. The login URL was copied if clipboard access is available.");
+      new import_obsidian9.Notice("Login page could not open automatically. The login URL was copied if clipboard access is available.");
     }
   }
   async finalizeLogin(input) {
@@ -3136,10 +3269,10 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
       const userInfo = await client.getUserInfo();
       this.settings.userEmail = userInfo.email;
       await this.saveSettings();
-      new import_obsidian8.Notice(`Successfully logged in as ${userInfo.email}!`);
+      new import_obsidian9.Notice(`Successfully logged in as ${userInfo.email}!`);
     } catch (error) {
       console.error("Login failed", error);
-      new import_obsidian8.Notice("Login failed: " + (error instanceof Error ? error.message : String(error)));
+      new import_obsidian9.Notice("Login failed: " + (error instanceof Error ? error.message : String(error)));
     }
   }
   extractOAuthParams(input) {
@@ -3161,7 +3294,7 @@ var GoogleDriveSyncPlugin = class extends import_obsidian8.Plugin {
     }
   }
 };
-var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab {
+var GoogleDriveSyncSettingTab = class extends import_obsidian9.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.authCode = "";
@@ -3177,51 +3310,51 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
     step1.createEl("h3", { text: "Step 1: API Credentials" });
     const hasKeys = this.plugin.settings.clientId && this.plugin.settings.clientSecret;
     if (hasKeys) {
-      new import_obsidian8.Setting(step1).setName("Keys Saved \u2713").setDesc("Your Client ID and Secret are configured.").addButton((btn) => btn.setButtonText("Edit Keys").onClick(() => {
+      new import_obsidian9.Setting(step1).setName("Keys Saved \u2713").setDesc("Your Client ID and Secret are configured.").addButton((btn) => btn.setButtonText("Edit Keys").onClick(() => {
         this.plugin.settings.clientId = "";
         this.plugin.settings.clientSecret = "";
         this.showCredentials = false;
         this.display();
       }));
-      new import_obsidian8.Setting(step1).setName("Another vault setup").setDesc("Show your saved Client ID and Secret to paste into Tether on another vault or device.").addButton((btn) => btn.setButtonText(this.showCredentials ? "Hide credentials" : "Show credentials").onClick(() => {
+      new import_obsidian9.Setting(step1).setName("Another vault setup").setDesc("Show your saved Client ID and Secret to paste into Tether on another vault or device.").addButton((btn) => btn.setButtonText(this.showCredentials ? "Hide credentials" : "Show credentials").onClick(() => {
         this.showCredentials = !this.showCredentials;
         this.display();
       }));
       if (this.showCredentials) {
-        new import_obsidian8.Setting(step1).setName("Client ID").addText((text) => text.setValue(this.plugin.settings.clientId).setDisabled(true));
-        new import_obsidian8.Setting(step1).setName("Client Secret").addText((text) => text.setValue(this.plugin.settings.clientSecret).setDisabled(true));
-        new import_obsidian8.Setting(step1).setName("Copy credentials").setDesc("Copy both values to paste into another vault's Tether settings.").addButton((btn) => btn.setButtonText("Copy").onClick(async () => {
+        new import_obsidian9.Setting(step1).setName("Client ID").addText((text) => text.setValue(this.plugin.settings.clientId).setDisabled(true));
+        new import_obsidian9.Setting(step1).setName("Client Secret").addText((text) => text.setValue(this.plugin.settings.clientSecret).setDisabled(true));
+        new import_obsidian9.Setting(step1).setName("Copy credentials").setDesc("Copy both values to paste into another vault's Tether settings.").addButton((btn) => btn.setButtonText("Copy").onClick(async () => {
           const text = [
             `Client ID: ${this.plugin.settings.clientId}`,
             `Client Secret: ${this.plugin.settings.clientSecret}`
           ].join("\n");
           try {
             await navigator.clipboard.writeText(text);
-            new import_obsidian8.Notice("Credentials copied to clipboard.");
+            new import_obsidian9.Notice("Credentials copied to clipboard.");
           } catch (e) {
             console.error("Failed to copy credentials", e);
-            new import_obsidian8.Notice("Failed to copy credentials.");
+            new import_obsidian9.Notice("Failed to copy credentials.");
           }
         }));
       }
     } else {
-      new import_obsidian8.Setting(step1).setName("Setup Guide").setDesc("First, follow this guide to get your keys.").addButton((button) => button.setButtonText("Open Guide").onClick(() => new SetupGuideModal(this.app).open()));
-      new import_obsidian8.Setting(step1).setName("Client ID").addText((text) => text.setPlaceholder("Enter Client ID").setValue(this.plugin.settings.clientId).onChange(async (value) => {
+      new import_obsidian9.Setting(step1).setName("Setup Guide").setDesc("First, follow this guide to get your keys.").addButton((button) => button.setButtonText("Open Guide").onClick(() => new SetupGuideModal(this.app).open()));
+      new import_obsidian9.Setting(step1).setName("Client ID").addText((text) => text.setPlaceholder("Enter Client ID").setValue(this.plugin.settings.clientId).onChange(async (value) => {
         this.plugin.settings.clientId = value;
         await this.plugin.saveSettings();
       }));
-      new import_obsidian8.Setting(step1).setName("Client Secret").addText((text) => text.setPlaceholder("Enter Client Secret").setValue(this.plugin.settings.clientSecret).onChange(async (value) => {
+      new import_obsidian9.Setting(step1).setName("Client Secret").addText((text) => text.setPlaceholder("Enter Client Secret").setValue(this.plugin.settings.clientSecret).onChange(async (value) => {
         this.plugin.settings.clientSecret = value;
         await this.plugin.saveSettings();
       }));
-      new import_obsidian8.Setting(step1).addButton((btn) => btn.setButtonText("Continue").setCta().onClick(() => this.display()));
+      new import_obsidian9.Setting(step1).addButton((btn) => btn.setButtonText("Continue").setCta().onClick(() => this.display()));
       return;
     }
     const step2 = containerEl.createEl("div", { cls: "gdrive-setup-step" });
     step2.createEl("h3", { text: "Step 2: Log in" });
     const isLoggedIn = !!this.plugin.settings.accessToken;
     if (isLoggedIn) {
-      new import_obsidian8.Setting(step2).setName("Logged in \u2713").setDesc(`Account: ${this.plugin.settings.userEmail}`).addButton((btn) => btn.setButtonText("Log Out").onClick(async () => {
+      new import_obsidian9.Setting(step2).setName("Logged in \u2713").setDesc(`Account: ${this.plugin.settings.userEmail}`).addButton((btn) => btn.setButtonText("Log Out").onClick(async () => {
         this.plugin.settings.accessToken = "";
         this.plugin.settings.accessTokenExpiresAt = 0;
         this.plugin.settings.refreshToken = "";
@@ -3232,10 +3365,10 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
         this.display();
       }));
     } else {
-      new import_obsidian8.Setting(step2).setName("Authorize Plugin").setDesc("Click to open Google login in your browser.").addButton((btn) => btn.setButtonText("Open Login Page").setCta().onClick(() => this.plugin.startLogin()));
-      new import_obsidian8.Setting(step2).setName("Authorization URL").setDesc("After logging in, copy the full redirected URL from your browser and paste it here.").addText((text) => text.setPlaceholder("Paste full URL here...").onChange((value) => this.authCode = value)).addButton((btn) => btn.setButtonText("Verify Login").onClick(async () => {
+      new import_obsidian9.Setting(step2).setName("Authorize Plugin").setDesc("Click to open Google login in your browser.").addButton((btn) => btn.setButtonText("Open Login Page").setCta().onClick(() => this.plugin.startLogin()));
+      new import_obsidian9.Setting(step2).setName("Authorization URL").setDesc("After logging in, copy the full redirected URL from your browser and paste it here.").addText((text) => text.setPlaceholder("Paste full URL here...").onChange((value) => this.authCode = value)).addButton((btn) => btn.setButtonText("Verify Login").onClick(async () => {
         if (!this.authCode) {
-          new import_obsidian8.Notice("Please paste the redirected URL first.");
+          new import_obsidian9.Notice("Please paste the redirected URL first.");
           return;
         }
         await this.plugin.finalizeLogin(this.authCode);
@@ -3246,7 +3379,7 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
     const step3 = containerEl.createEl("div", { cls: "gdrive-setup-step" });
     step3.createEl("h3", { text: "Step 3: Choose Folder" });
     const hasFolder = !!this.plugin.settings.folderId;
-    new import_obsidian8.Setting(step3).setName(hasFolder ? "Folder Selected \u2713" : "Select Sync Folder").setDesc(hasFolder ? `Syncing with: ${this.plugin.settings.folderName}` : "Choose where to sync your notes.").addButton((btn) => {
+    new import_obsidian9.Setting(step3).setName(hasFolder ? "Folder Selected \u2713" : "Select Sync Folder").setDesc(hasFolder ? `Syncing with: ${this.plugin.settings.folderName}` : "Choose where to sync your notes.").addButton((btn) => {
       btn.setButtonText(hasFolder ? "Change Folder" : "Select Folder");
       if (!hasFolder)
         btn.setCta();
@@ -3260,7 +3393,7 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
           this.plugin.settings.folderName = folder.name;
           await this.plugin.saveSettings();
           this.display();
-          new import_obsidian8.Notice(`Sync folder set to ${folder.name}. Starting initial push...`);
+          new import_obsidian9.Notice(`Sync folder set to ${folder.name}. Starting initial push...`);
           this.plugin.pushSync();
         }).open();
       });
@@ -3269,15 +3402,15 @@ var GoogleDriveSyncSettingTab = class extends import_obsidian8.PluginSettingTab 
       return;
     const step4 = containerEl.createEl("div", { cls: "gdrive-setup-step" });
     step4.createEl("h3", { text: "Step 4: Sync Settings" });
-    new import_obsidian8.Setting(step4).setName("Sync on Startup").setDesc("Pull Google Drive changes when Obsidian opens.").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
+    new import_obsidian9.Setting(step4).setName("Sync on Startup").setDesc("Pull Google Drive changes when Obsidian opens.").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
       this.plugin.settings.syncOnStartup = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Sync Interval (minutes)").setDesc("Minutes between automatic pushes to Google Drive (0 to disable).").addText((text) => text.setPlaceholder("15").setValue(this.plugin.settings.syncInterval.toString()).onChange(async (value) => {
+    new import_obsidian9.Setting(step4).setName("Sync Interval (minutes)").setDesc("Minutes between automatic pushes to Google Drive (0 to disable).").addText((text) => text.setPlaceholder("15").setValue(this.plugin.settings.syncInterval.toString()).onChange(async (value) => {
       this.plugin.settings.syncInterval = parseInt(value) || 0;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian8.Setting(step4).setName("Manual Sync").setDesc("Startup pulls Drive changes. The timer and manual sync push local changes.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync())).addButton((btn) => btn.setButtonText(this.plugin.settings.syncPaused ? "Resume Auto Sync" : "Stop Auto Sync").onClick(async () => {
+    new import_obsidian9.Setting(step4).setName("Manual Sync").setDesc("Startup pulls Drive changes. The timer and manual sync push local changes.").addButton((btn) => btn.setButtonText("Pull").onClick(() => this.plugin.pullSync())).addButton((btn) => btn.setButtonText("Push").setCta().onClick(() => this.plugin.pushSync())).addButton((btn) => btn.setButtonText(this.plugin.settings.syncPaused ? "Resume Auto Sync" : "Stop Auto Sync").onClick(async () => {
       if (this.plugin.settings.syncPaused) {
         await this.plugin.resumeAutomaticSync();
       } else {

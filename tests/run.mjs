@@ -35,6 +35,7 @@ const obsidianStub = {
 					constructor(_leaf?: any) {}
 				}
 				export class TFile {}
+					export class MarkdownView {}
 				export const normalizePath = (path: string) => path.replace(/\\\\/g, '/');
 				export const requestUrl = async () => { throw new Error('Unexpected live request in test.'); };
 			`

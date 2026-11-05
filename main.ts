@@ -6,6 +6,7 @@ import { FolderSuggestModal } from './ui/folder-modal';
 import { SetupGuideModal } from './ui/setup-guide';
 import { OAuthManager, OAuthTokenResponse } from './auth/oauth';
 import { SyncStatusView, VIEW_TYPE_SYNC_STATUS } from './ui/sync-view';
+import { HandwritingLayoutSupport } from './sync/handwriting-layout';
 
 const STARTUP_PULL_DELAY_MS = 5000;
 const BACKGROUND_SYNC_IDLE_DELAY_MS = 60000;
@@ -63,6 +64,7 @@ export default class GoogleDriveSyncPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		new HandwritingLayoutSupport(this).start();
 
 		this.registerView(
 			VIEW_TYPE_SYNC_STATUS,
